@@ -19,10 +19,24 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
       - name: build
         run: cmake --build build -j$(nproc)
+      - name: build launcher apk
+        run: |
+          SRC=$(find . -name LauncherMain.java -not -path "./third_party/*" | head -1)
+          MAN=$(find . -name launcher_manifest.xml -not -path "./third_party/*" | head -1)
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          PL=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -1)/android.jar
+          mkdir -p apk/obj apk/dex
+          $BT/aapt2 link -o apk/base.apk -I $PL --manifest $MAN --min-sdk-version 24 --target-sdk-version 28 --version-code 1 --version-name 1
+          javac -source 8 -target 8 -Xlint:-options -classpath $PL -d apk/obj $SRC
+          $BT/d8 --lib $PL --min-api 24 --output apk/dex $(find apk/obj -name '*.class')
+          (cd apk/dex && zip -q ../base.apk classes.dex)
+          $BT/zipalign -f -p 4 apk/base.apk apk/aligned.apk
+          keytool -genkeypair -keystore apk/k.jks -storepass android -keypass android -alias k -dname CN=esp -keyalg RSA -keysize 2048 -validity 10000
+          $BT/apksigner sign --ks apk/k.jks --ks-pass pass:android --out build/launcher.apk apk/aligned.apk
       - name: bundle single esp.sh
         run: |
-          T=esp_template.sh; [ -f $T ] || T=$(find . -name esp_template.sh | head -1)
-          { cat $T; echo "LIB:$(base64 -w0 build/libesp.so)"; echo "INJ:$(base64 -w0 build/injector)"; } > build/esp.sh
+          T=$(find . -name esp_template.sh -not -path "./third_party/*" | head -1)
+          { cat $T; echo "LIB:$(base64 -w0 build/libesp.so)"; echo "INJ:$(base64 -w0 build/injector)"; echo "APK:$(base64 -w0 build/launcher.apk)"; } > build/esp.sh
       - uses: actions/upload-artifact@v4
         with:
           name: libesp-arm64-v8a
@@ -30,3 +44,4 @@ jobs:
             build/esp.sh
             build/libesp.so
             build/injector
+            build/launcher.apk
