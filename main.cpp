@@ -11,6 +11,8 @@
 #include <GLES3/gl3.h>
 #include <mutex>
 #include <vector>
+#include <utility>
+#include <unordered_map>
 #include <string>
 #include <chrono>
 #include <cmath>
@@ -84,7 +86,7 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
     float maxd = 200, thick = 2;
 } C;
@@ -97,9 +99,9 @@ static std::vector<std::string> CfgPaths() {
 }
 static void Save() {
     char buf[700];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"maxd\":%g,\"thick\":%g,"
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"maxd\":%g,\"thick\":%g,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -113,7 +115,7 @@ static void Load() {
         char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
-        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -121,7 +123,7 @@ static void Load() {
 }
 
 // ---------- shared snapshot (game thread writes, render thread reads) ----------
-struct Ent { ImVec2 head, feet; int hp; float dist; bool enemy; char name[40]; };
+struct Ent { ImVec2 head, feet; int hp; float dist; bool enemy; char name[40]; std::vector<std::pair<ImVec2, ImVec2>> bones; };
 static std::mutex g_mx;
 static std::vector<Ent> g_ents;
 static float g_sw = 0, g_sh = 0;
@@ -131,7 +133,8 @@ static struct { bool down = false; float x = 0, y = 0; } g_touch; // y raw, bott
 static Il2CppClass *kPC, *kComp, *kCam, *kTr, *kObj, *kInput, *kPhView, *kPlayer;
 static MethodInfo *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
                   *mNick, *mProps, *mItem;
-static int oView, oPlayer, oDead, oCam;
+static int oView, oPlayer, oDead, oCam, oAnim = -1, oSkel = -1, oSkelCt = -1, oSkelTr = -1, oRag = -1, oBone[7] = {-1, -1, -1, -1, -1, -1, -1};
+static MethodInfo* mGetParent;
 static Il2CppObject* g_pcType;
 static Il2CppArray* g_arr; static int g_tick;
 
@@ -159,6 +162,41 @@ static bool W2S(void* cam, float x, float y, float z, ImVec2& out) {
     auto r = Inv(mW2S, cam, a); if (!r) return false;
     float* s = (float*)((char*)r + 0x10); if (s[2] <= 0.f) return false;
     out = ImVec2(s[0], s[1]); return true; // y still bottom-up, flipped at draw
+}
+// skeleton = lines between ragdoll bones, parent link = nearest ancestor transform that is also a bone
+struct SkelC { void* anim = nullptr; void* skel = nullptr; std::vector<void*> tr; std::vector<int> par; };
+static std::unordered_map<void*, SkelC> g_skel;
+static void Skel(void* pc, void* cam, Ent& e) {
+    if (oAnim < 0 || oSkel < 0) return;
+    void* anim = Fld<void*>(pc, oAnim); if (!anim) return;
+    void* sk = Fld<void*>(anim, oSkel);
+    if (!sk && oSkelCt >= 0) sk = Fld<void*>(anim, oSkelCt);
+    if (!sk && oSkelTr >= 0) sk = Fld<void*>(anim, oSkelTr);
+    if (!sk) return;
+    auto it = g_skel.find(pc);
+    if (it == g_skel.end() || it->second.anim != anim || it->second.skel != sk) {   // (re)build the bone list
+        if (g_skel.size() > 64) g_skel.clear();
+        SkelC sc; sc.anim = anim; sc.skel = sk;
+        std::vector<void*> rbs;
+        auto arr = oRag >= 0 ? Fld<Il2CppArray*>(sk, oRag) : nullptr;
+        if (arr) for (uintptr_t i = 0; i < arr->len && i < 40; i++) if (arr->items[i]) rbs.push_back(arr->items[i]);
+        if (rbs.empty()) for (int k = 0; k < 7; k++) if (oBone[k] >= 0) { void* r = Fld<void*>(sk, oBone[k]); if (r) rbs.push_back(r); }
+        for (void* r : rbs) { auto t = Inv(mGetTr, r); if (t) sc.tr.push_back(t); }
+        sc.par.assign(sc.tr.size(), -1);
+        auto idxOf = [&](void* p) { for (size_t j = 0; j < sc.tr.size(); j++) if (sc.tr[j] == p) return (int)j; return -1; };
+        for (size_t i = 0; i < sc.tr.size(); i++) {
+            void* p = sc.tr[i];
+            for (int d = 0; d < 8 && p; d++) { p = Inv(mGetParent, p); int j = p ? idxOf(p) : -1; if (j >= 0) { sc.par[i] = j; break; } }
+        }
+        it = g_skel.insert_or_assign(pc, std::move(sc)).first;
+    }
+    auto& sc = it->second;
+    std::vector<ImVec2> sp(sc.tr.size()); std::vector<char> ok(sc.tr.size(), 0);
+    for (size_t i = 0; i < sc.tr.size(); i++) {
+        auto pv = Inv(mGetPos, sc.tr[i]); if (!pv) continue;
+        float* v = (float*)((char*)pv + 0x10); ok[i] = W2S(cam, v[0], v[1], v[2], sp[i]);
+    }
+    for (size_t i = 0; i < sc.tr.size(); i++) if (sc.par[i] >= 0 && ok[i] && ok[sc.par[i]]) e.bones.push_back({sp[sc.par[i]], sp[i]});
 }
 static int HP(Il2CppObject* o) {
     if (!o) return 100; const char* n = il2cpp_class_get_name(il2cpp_object_get_class(o));
@@ -198,6 +236,7 @@ static void Collect() {
             int t = TeamOf(pl); e.enemy = true;
             if (C.team && myTeam && t == myTeam) { hidden++; continue; }   // teammate
             snprintf(e.name, sizeof e.name, "%s", Str((Il2CppString*)Inv(mNick, pl)).c_str());
+            if (C.skel) Skel(pc, cam, e);
             out.push_back(e);
         }
     }
@@ -230,6 +269,8 @@ static void Draw(int w, int h, float sx, float sy) {
         if (bh < 4) continue;
         ImU32 col = ImGui::ColorConvertFloat4ToU32(*(ImVec4*)(e.enemy ? C.ecol : C.tcol));
         if (C.lines) dl->AddLine(ImVec2(w * .5f, (float)h), ImVec2(cx, fy), col, C.thick);
+        if (C.skel) for (auto& b : e.bones)
+            dl->AddLine(ImVec2(b.first.x * sx, h - b.first.y * sy), ImVec2(b.second.x * sx, h - b.second.y * sy), col, C.thick);
         if (C.box) dl->AddRect(ImVec2(cx - bw / 2, hy), ImVec2(cx + bw / 2, fy), col, 0, 0, C.thick);
         if (C.hp) {
             float f = fminf(fmaxf(e.hp / 100.f, 0), 1), x = cx - bw / 2 - 6;
@@ -246,7 +287,7 @@ static void Menu() {
     ImGui::Begin("esp", &g_menu, ImGuiWindowFlags_NoSavedSettings);
     if (ImGui::BeginTabBar("t")) {
         if (ImGui::BeginTabItem("ESP")) {
-            ImGui::Checkbox("enable", &C.esp); ImGui::Checkbox("box", &C.box); ImGui::Checkbox("health", &C.hp);
+            ImGui::Checkbox("enable", &C.esp); ImGui::Checkbox("box", &C.box); ImGui::Checkbox("skeleton", &C.skel); ImGui::Checkbox("health", &C.hp);
             ImGui::Checkbox("name", &C.name); ImGui::Checkbox("distance", &C.dist); ImGui::Checkbox("snaplines", &C.lines);
             ImGui::Checkbox("hide teammates", &C.team); ImGui::SliderFloat("max dist", &C.maxd, 20, 500); ImGui::SliderFloat("thickness", &C.thick, 1, 5);
             ImGui::ColorEdit4("enemy", C.ecol, ImGuiColorEditFlags_NoInputs);
@@ -318,13 +359,19 @@ static void* Boot(void*) {
     kPC = Cls("", "PlayerController"); kComp = Cls("UnityEngine", "Component"); kCam = Cls("UnityEngine", "Camera");
     kTr = Cls("UnityEngine", "Transform"); kObj = Cls("UnityEngine", "Object"); kInput = Cls("UnityEngine", "Input");
     kPhView = Cls("Photon.Pun", "PhotonView"); kPlayer = Cls("Photon.Realtime", "Player");
-    mFind = Meth(kObj, "FindObjectsOfType", 2); mGetTr = Meth(kComp, "get_transform", 0); mGetPos = Meth(kTr, "get_position", 0);
+    mFind = Meth(kObj, "FindObjectsOfType", 2); mGetTr = Meth(kComp, "get_transform", 0); mGetPos = Meth(kTr, "get_position", 0); mGetParent = Meth(kTr, "get_parent", 0);
     mCamMain = Meth(kCam, "get_main", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
     { auto kScr = Cls("UnityEngine", "Screen"); mScrW = Meth(kScr, "get_width", 0); mScrH = Meth(kScr, "get_height", 0); }
     mTouchCnt = Meth(kInput, "get_touchCount", 0); mGetTouch = Meth(kInput, "GetTouch", 1);
     mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
     mNick = Meth(kPlayer, "get_NickName", 0); mProps = Meth(kPlayer, "get_CustomProperties", 0);
     oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath"); oCam = Off(kPC, "_mainCamera");
+    { auto kPAC = Cls("", "PlayerAnimatorController"); auto kSk = Cls("", "PlayerSkeleton");
+      oAnim = Off(kPC, "_animatorController"); oSkel = Off(kPAC, "_skeleton"); oSkelCt = Off(kPAC, "_ctSkeleton"); oSkelTr = Off(kPAC, "_trSkeleton");
+      oRag = Off(kSk, "ragdollRigidbodies");
+      const char* bn[7] = {"_headBone", "_chestBone", "_pelvisBone", "_leftUpperArm", "_rightUpperArm", "_leftThigh", "_rightThigh"};
+      for (int i = 0; i < 7; i++) oBone[i] = Off(kSk, bn[i]);
+      LOG("skeleton offsets anim=%d skel=%d rag=%d parent=%p", oAnim, oSkel, oRag, (void*)mGetParent); }
     LOG("resolve PC=%p find=%p w2s=%p touch=%p/%p isMine=%p nick=%p props=%p off=%d/%d/%d",
         kPC, mFind, mW2S, mTouchCnt, mGetTouch, mIsMine, mNick, mProps, oView, oPlayer, oDead);
     if (!kPC || !mFind || !mW2S || oView < 0 || oPlayer < 0 || oDead < 0) { LOG("resolve failed, menu only"); }
