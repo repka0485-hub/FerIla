@@ -1,0 +1,32 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  android-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch deps
+        run: |
+          git clone --depth 1 --branch v1.91.4 https://github.com/ocornut/imgui third_party/imgui
+          git clone --depth 1 https://github.com/Rprop/And64InlineHook third_party/And64InlineHook
+      - name: configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24
+          -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build -j$(nproc)
+      - name: bundle single esp.sh
+        run: |
+          T=esp_template.sh; [ -f $T ] || T=$(find . -name esp_template.sh | head -1)
+          { cat $T; echo "LIB:$(base64 -w0 build/libesp.so)"; echo "INJ:$(base64 -w0 build/injector)"; } > build/esp.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libesp-arm64-v8a
+          path: |
+            build/esp.sh
+            build/libesp.so
+            build/injector
