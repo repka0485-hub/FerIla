@@ -1,6 +1,7 @@
 // internal ESP, Unity il2cpp, android arm64. everything resolved by name at runtime (no RVAs).
 #include <jni.h>
 #include <android/log.h>
+#include <stdint.h>
 #include <dlfcn.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -39,6 +40,8 @@ API(Il2CppObject*, il2cpp_runtime_invoke, (MethodInfo*, void*, void**, Il2CppObj
 API(Il2CppClass*, il2cpp_object_get_class, (Il2CppObject*));
 API(const char*, il2cpp_class_get_name, (Il2CppClass*));
 API(Il2CppString*, il2cpp_string_new, (const char*));
+API(uint32_t, il2cpp_gchandle_new, (Il2CppObject*, bool));
+API(void, il2cpp_gchandle_free, (uint32_t));
 
 static Il2CppDomain* g_dom;
 
@@ -47,7 +50,7 @@ static bool ResolveApi(void* h) {
     R(il2cpp_domain_get) R(il2cpp_domain_get_assemblies) R(il2cpp_assembly_get_image)
     R(il2cpp_class_from_name) R(il2cpp_class_get_method_from_name) R(il2cpp_class_get_field_from_name)
     R(il2cpp_field_get_offset) R(il2cpp_thread_attach) R(il2cpp_class_get_type) R(il2cpp_type_get_object)
-    R(il2cpp_runtime_invoke) R(il2cpp_object_get_class) R(il2cpp_class_get_name) R(il2cpp_string_new)
+    R(il2cpp_runtime_invoke) R(il2cpp_object_get_class) R(il2cpp_class_get_name) R(il2cpp_string_new) R(il2cpp_gchandle_new) R(il2cpp_gchandle_free)
 #undef R
     return true;
 }
@@ -110,13 +113,14 @@ static void Load() {
 struct Ent { ImVec2 head, feet; int hp; float dist; bool enemy; char name[40]; };
 static std::mutex g_mx;
 static std::vector<Ent> g_ents;
+static float g_sw = 0, g_sh = 0;
 static struct { bool down = false; float x = 0, y = 0; } g_touch; // y raw, bottom-up
 
 // ---------- game side ----------
 static Il2CppClass *kPC, *kComp, *kCam, *kTr, *kObj, *kInput, *kPhView, *kPlayer;
-static MethodInfo *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
+static MethodInfo *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
                   *mNick, *mProps, *mItem;
-static int oView, oPlayer, oDead;
+static int oView, oPlayer, oDead, oCam;
 static Il2CppObject* g_pcType;
 static Il2CppArray* g_arr; static int g_tick;
 
@@ -141,47 +145,59 @@ static bool W2S(void* cam, float x, float y, float z, ImVec2& out) {
     float* s = (float*)((char*)r + 0x10); if (s[2] <= 0.f) return false;
     out = ImVec2(s[0], s[1]); return true; // y still bottom-up, flipped at draw
 }
+static int HP(Il2CppObject* o) {
+    if (!o) return 100; const char* n = il2cpp_class_get_name(il2cpp_object_get_class(o));
+    if (!strcmp(n, "Int32")) return Unbox<int>(o); if (!strcmp(n, "Single")) return (int)Unbox<float>(o); return 100;
+}
+static uint32_t g_arrH;
 static void Collect() {
-    if (!g_pcType) { /* no player data, still pump touch below */ }
+    static int logn = 0; void* dbgLocal = nullptr; void* dbgCam = nullptr;
     if (g_pcType && (!g_arr || (g_tick++ % 30) == 0)) {
         bool inc = false; void* a[2] = {g_pcType, &inc};
-        g_arr = (Il2CppArray*)Inv(mFind, nullptr, a);
+        auto arr = (Il2CppArray*)Inv(mFind, nullptr, a);
+        if (g_arrH) il2cpp_gchandle_free(g_arrH);          // keep the array alive for the GC while we cache it
+        g_arrH = arr ? il2cpp_gchandle_new((Il2CppObject*)arr, false) : 0; g_arr = arr;
     }
     std::vector<Ent> out;
     if (g_arr) {
-        void* local = nullptr; int myTeam = 0; float lp[3] = {};
+        void* local = nullptr; int myTeam = 0; float lp[3] = {}; bool haveLp = false;
         for (uintptr_t i = 0; i < g_arr->len; i++) {
             void* pc = g_arr->items[i]; if (!pc) continue;
             auto view = Fld<Il2CppObject*>(pc, oView);
-            if (view && Unbox<bool>(Inv(mIsMine, view))) {
-                local = pc; myTeam = TeamOf(Fld<Il2CppObject*>(pc, oPlayer)); Pos(pc, lp); break;
-            }
+            if (view && Unbox<bool>(Inv(mIsMine, view))) { local = pc; myTeam = TeamOf(Fld<Il2CppObject*>(pc, oPlayer)); haveLp = Pos(pc, lp); break; }
         }
-        auto cam = Inv(mCamMain, nullptr);
-        if (local && cam) for (uintptr_t i = 0; i < g_arr->len; i++) {
+        Il2CppObject* cam = (local && oCam >= 0) ? Fld<Il2CppObject*>(local, oCam) : nullptr;
+        if (!cam) cam = Inv(mCamMain, nullptr);
+        if (cam && !haveLp) haveLp = Pos(cam, lp);           // no local player found: measure from the camera
+        dbgLocal = local; dbgCam = cam;
+        if (cam && haveLp) for (uintptr_t i = 0; i < g_arr->len; i++) {
             void* pc = g_arr->items[i]; if (!pc || pc == local) continue;
             if (Fld<bool>(pc, oDead)) continue;
             float p[3]; if (!Pos(pc, p)) continue;
-            Ent e{}; if (!W2S(cam, p[0], p[1], p[2], e.feet) || !W2S(cam, p[0], p[1] + 1.8f, p[2], e.head)) continue;
-            e.dist = sqrtf(powf(p[0] - lp[0], 2) + powf(p[1] - lp[1], 2) + powf(p[2] - lp[2], 2));
-            e.hp = Unbox<int>(Inv(mHealth, pc));
+            float dist = sqrtf(powf(p[0] - lp[0], 2) + powf(p[1] - lp[1], 2) + powf(p[2] - lp[2], 2));
+            if (!local && dist < 1.5f) continue;             // fallback mode: skip our own body
+            Ent e{}; e.dist = dist;
+            if (!W2S(cam, p[0], p[1], p[2], e.feet) || !W2S(cam, p[0], p[1] + 1.8f, p[2], e.head)) continue;
+            e.hp = HP(Inv(mHealth, pc));
             auto pl = Fld<Il2CppObject*>(pc, oPlayer);
             int t = TeamOf(pl); e.enemy = !(C.team && t && t == myTeam);
             snprintf(e.name, sizeof e.name, "%s", Str((Il2CppString*)Inv(mNick, pl)).c_str());
             out.push_back(e);
         }
     }
+    if ((logn++ % 250) == 0) LOG("collect: players=%lu local=%p cam=%p drawn=%lu", g_arr ? (unsigned long)g_arr->len : 0UL, dbgLocal, dbgCam, (unsigned long)out.size());
     // touch (legacy Input, main thread only)
     bool down = false; float tx = 0, ty = 0;
     int n = Unbox<int>(Inv(mTouchCnt, nullptr));
     if (n > 0) { int idx = 0; void* a[1] = {&idx}; auto t = Inv(mGetTouch, nullptr, a);
+        static int dbg = 0; if (dbg++ < 5) LOG("touch n=%d obj=%p", n, (void*)t);
         if (t) { float* f = (float*)((char*)t + 0x10); tx = f[1]; ty = f[2]; int ph = *(int*)&f[9]; down = ph != 3 && ph != 4; } }
-    std::lock_guard<std::mutex> l(g_mx); g_ents.swap(out); g_touch = {down, tx, ty};
+    float sw = (float)Unbox<int>(Inv(mScrW, nullptr)), sh = (float)Unbox<int>(Inv(mScrH, nullptr));
+    std::lock_guard<std::mutex> l(g_mx); g_ents.swap(out); g_touch = {down, tx, ty}; g_sw = sw; g_sh = sh;
 }
 static void (*orig_update)(void*, MethodInfo*); static MethodInfo* mUpdate;
 static void (*orig_es)(void*, MethodInfo*); static MethodInfo* mEs;
-static void Tick() { // main thread only, ~120Hz max
-    if (gettid() != getpid()) return;
+static void Tick() { // called from Unity script thread (hooks), ~120Hz max
     static auto last = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now();
     if (now - last > std::chrono::milliseconds(8)) { last = now; Collect(); }
 }
@@ -189,12 +205,12 @@ static void hook_update(void* self, MethodInfo* mi) { Tick(); orig_update(self, 
 static void hook_es(void* self, MethodInfo* mi) { Tick(); orig_es(self, mi); } // EventSystem.Update: runs in lobby too, keeps touch alive
 
 // ---------- render side ----------
-static void Draw(int w, int h) {
+static void Draw(int w, int h, float sx, float sy) {
     auto dl = ImGui::GetBackgroundDrawList();
     std::vector<Ent> es; { std::lock_guard<std::mutex> l(g_mx); es = g_ents; }
     for (auto& e : es) {
         if (e.dist > C.maxd) continue;
-        float fy = h - e.feet.y, hy = h - e.head.y, bh = fy - hy, bw = bh * .5f, cx = e.head.x;
+        float fy = h - e.feet.y * sy, hy = h - e.head.y * sy, bh = fy - hy, bw = bh * .5f, cx = e.head.x * sx;
         if (bh < 4) continue;
         ImU32 col = ImGui::ColorConvertFloat4ToU32(*(ImVec4*)(e.enemy ? C.ecol : C.tcol));
         if (C.lines) dl->AddLine(ImVec2(w * .5f, (float)h), ImVec2(cx, fy), col, C.thick);
@@ -256,9 +272,11 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
         ImGui_ImplOpenGL3_Init("#version 300 es"); Load(); g_init = true; LOG("imgui init %dx%d", w, h);
     }
     auto& io = ImGui::GetIO(); io.DisplaySize = ImVec2((float)w, (float)h);
-    { std::lock_guard<std::mutex> l(g_mx); io.AddMousePosEvent(g_touch.x, h - g_touch.y); io.AddMouseButtonEvent(0, g_touch.down); }
+    float sx = 1, sy = 1;
+    { std::lock_guard<std::mutex> l(g_mx); if (g_sw > 1) sx = w / g_sw; if (g_sh > 1) sy = h / g_sh;
+      io.AddMousePosEvent(g_touch.x * sx, h - g_touch.y * sy); io.AddMouseButtonEvent(0, g_touch.down); }
     ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
-    if (C.esp) Draw(w, h);
+    if (C.esp) Draw(w, h, sx, sy);
     Bubble((float)w, (float)h);
     if (g_menu) Menu();
     ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -281,10 +299,11 @@ static void* Boot(void*) {
     kPhView = Cls("Photon.Pun", "PhotonView"); kPlayer = Cls("Photon.Realtime", "Player");
     mFind = Meth(kObj, "FindObjectsOfType", 2); mGetTr = Meth(kComp, "get_transform", 0); mGetPos = Meth(kTr, "get_position", 0);
     mCamMain = Meth(kCam, "get_main", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
+    { auto kScr = Cls("UnityEngine", "Screen"); mScrW = Meth(kScr, "get_width", 0); mScrH = Meth(kScr, "get_height", 0); }
     mTouchCnt = Meth(kInput, "get_touchCount", 0); mGetTouch = Meth(kInput, "GetTouch", 1);
     mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
     mNick = Meth(kPlayer, "get_NickName", 0); mProps = Meth(kPlayer, "get_CustomProperties", 0);
-    oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath");
+    oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath"); oCam = Off(kPC, "_mainCamera");
     LOG("resolve PC=%p find=%p w2s=%p touch=%p/%p isMine=%p nick=%p props=%p off=%d/%d/%d",
         kPC, mFind, mW2S, mTouchCnt, mGetTouch, mIsMine, mNick, mProps, oView, oPlayer, oDead);
     if (!kPC || !mFind || !mW2S || oView < 0 || oPlayer < 0 || oDead < 0) { LOG("resolve failed, menu only"); }

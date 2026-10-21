@@ -1,7 +1,8 @@
 #!/system/bin/sh
 # single-file esp: libesp.so and injector are embedded at the end of this file.
-# root. run ONCE, it stays in the background and injects every time the game starts:
+# root. run ONCE: starts the game and injects, then keeps watching and injects on every later game start:
 #   su -c "sh /data/local/tmp/esp.sh"         start watcher (until reboot)
+#   su -c "sh /data/local/tmp/esp.sh nogles"  same, but start the game normally (no forced GLES)
 #   su -c "sh /data/local/tmp/esp.sh boot"    same + autostart after every reboot (magisk service.d)
 #   su -c "sh /data/local/tmp/esp.sh off"     stop watcher, remove autostart
 #   log: cat /data/local/tmp/esp.log
@@ -24,6 +25,11 @@ watch) # the background loop
       grep -q libesp.so /proc/$PID/maps 2>/dev/null || "$INJ" "$PID" "$LIB"
       if grep -q libesp.so /proc/$PID/maps 2>/dev/null; then echo "$(date +%T) injected, pid $PID"
       else echo "$(date +%T) FAILED pid $PID, check: logcat -d | grep -i -E 'ESP|avc'"; fi
+      ( sleep 20; { echo "--- diag pid $PID"
+          echo "maps: vulkan=$(grep -c libvulkan /proc/$PID/maps) egl=$(grep -c libEGL /proc/$PID/maps) gles3=$(grep -c libGLESv3 /proc/$PID/maps) il2cpp=$(grep -c libil2cpp /proc/$PID/maps) esp=$(grep -c libesp /proc/$PID/maps)"
+          logcat -d -s ESP | tail -30
+          logcat -d | grep -i -E "avc.*(libesp|CounterFlame|injector)" | tail -5
+          echo "--- end diag"; } >> "$D/esp.log" 2>&1 ) &
       LAST=$PID
     fi
     sleep 1
@@ -39,6 +45,11 @@ watch) # the background loop
   if [ "$1" = "boot" ]; then
     mkdir -p /data/adb/service.d && printf '#!/system/bin/sh\nsh %s watch >%s 2>&1 </dev/null &\n' "$ME" "$D/esp.log" > "$BOOT" && chmod 755 "$BOOT" && echo "autostart on"
   fi
-  echo "watcher started, just open the game"
+  # restart the game with OpenGL ES forced (the menu draws through GLES, a Vulkan game would show nothing)
+  ACT=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER "$PKG" 2>/dev/null | tail -1)
+  am force-stop "$PKG"; sleep 1
+  if [ "$1" = "nogles" ] || [ -z "$ACT" ]; then monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+  else am start -n "$ACT" -e unity "-force-gles" >/dev/null 2>&1; fi
+  echo "watcher started, game launching, injects by itself (log: cat $D/esp.log)"
   exit 0 ;;
 esac
