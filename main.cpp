@@ -1,0 +1,280 @@
+// internal ESP, Unity il2cpp, android arm64. everything resolved by name at runtime (no RVAs).
+#include <jni.h>
+#include <android/log.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include <mutex>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include "imgui.h"
+#include "imgui_impl_opengl3.h"
+extern "C" void A64HookFunction(void* symbol, void* replace, void** result); // And64InlineHook
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "ESP", __VA_ARGS__)
+
+// ---------- il2cpp api ----------
+struct Il2CppDomain; struct Il2CppAssembly; struct Il2CppImage; struct Il2CppClass;
+struct Il2CppObject; struct Il2CppString; struct Il2CppType; struct FieldInfo;
+struct MethodInfo { void* methodPointer; };
+struct Il2CppArray { void* k; void* mon; void* bounds; uintptr_t len; void* items[1]; };
+
+#define API(ret, name, args) static ret (*name) args
+API(Il2CppDomain*, il2cpp_domain_get, ());
+API(Il2CppAssembly**, il2cpp_domain_get_assemblies, (Il2CppDomain*, size_t*));
+API(Il2CppImage*, il2cpp_assembly_get_image, (Il2CppAssembly*));
+API(Il2CppClass*, il2cpp_class_from_name, (Il2CppImage*, const char*, const char*));
+API(MethodInfo*, il2cpp_class_get_method_from_name, (Il2CppClass*, const char*, int));
+API(FieldInfo*, il2cpp_class_get_field_from_name, (Il2CppClass*, const char*));
+API(size_t, il2cpp_field_get_offset, (FieldInfo*));
+API(void*, il2cpp_thread_attach, (Il2CppDomain*));
+API(const Il2CppType*, il2cpp_class_get_type, (Il2CppClass*));
+API(Il2CppObject*, il2cpp_type_get_object, (const Il2CppType*));
+API(Il2CppObject*, il2cpp_runtime_invoke, (MethodInfo*, void*, void**, Il2CppObject**));
+API(Il2CppClass*, il2cpp_object_get_class, (Il2CppObject*));
+API(const char*, il2cpp_class_get_name, (Il2CppClass*));
+API(Il2CppString*, il2cpp_string_new, (const char*));
+
+static Il2CppDomain* g_dom;
+
+static bool ResolveApi(void* h) {
+#define R(n) if (!(n = (decltype(n))dlsym(h, #n))) return false;
+    R(il2cpp_domain_get) R(il2cpp_domain_get_assemblies) R(il2cpp_assembly_get_image)
+    R(il2cpp_class_from_name) R(il2cpp_class_get_method_from_name) R(il2cpp_class_get_field_from_name)
+    R(il2cpp_field_get_offset) R(il2cpp_thread_attach) R(il2cpp_class_get_type) R(il2cpp_type_get_object)
+    R(il2cpp_runtime_invoke) R(il2cpp_object_get_class) R(il2cpp_class_get_name) R(il2cpp_string_new)
+#undef R
+    return true;
+}
+
+static Il2CppClass* Cls(const char* ns, const char* n) {
+    size_t c = 0; auto as = il2cpp_domain_get_assemblies(g_dom, &c);
+    for (size_t i = 0; i < c; i++)
+        if (auto k = il2cpp_class_from_name(il2cpp_assembly_get_image(as[i]), ns, n)) return k;
+    return nullptr;
+}
+static MethodInfo* Meth(Il2CppClass* k, const char* n, int argc) { return k ? il2cpp_class_get_method_from_name(k, n, argc) : nullptr; }
+static int Off(Il2CppClass* k, const char* n) { auto f = k ? il2cpp_class_get_field_from_name(k, n) : nullptr; return f ? (int)il2cpp_field_get_offset(f) : -1; }
+static Il2CppObject* Inv(MethodInfo* m, void* o, void** a = nullptr) {
+    if (!m) return nullptr; Il2CppObject* ex = nullptr; auto r = il2cpp_runtime_invoke(m, o, a, &ex); return ex ? nullptr : r;
+}
+template <class T> static T Unbox(Il2CppObject* o, T d = {}) { return o ? *(T*)((char*)o + 0x10) : d; }
+template <class T> static T Fld(void* o, int off) { return *(T*)((char*)o + off); }
+static std::string Str(Il2CppString* s) { // utf16 -> utf8
+    std::string r; if (!s) return r;
+    int n = *(int*)((char*)s + 0x10); auto c = (const char16_t*)((char*)s + 0x14);
+    for (int i = 0; i < n; i++) {
+        unsigned u = c[i];
+        if (u < 0x80) r += (char)u;
+        else if (u < 0x800) { r += (char)(0xC0 | u >> 6); r += (char)(0x80 | (u & 63)); }
+        else { r += (char)(0xE0 | u >> 12); r += (char)(0x80 | ((u >> 6) & 63)); r += (char)(0x80 | (u & 63)); }
+    }
+    return r;
+}
+
+// ---------- config ----------
+struct Cfg {
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true;
+    float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
+    float maxd = 200, thick = 2;
+} C;
+static bool g_menu = true;
+static std::string CfgPath() {
+    char b[128] = {}; FILE* f = fopen("/proc/self/cmdline", "r"); if (f) { fread(b, 1, 127, f); fclose(f); }
+    return std::string("/data/data/") + b + "/files/esp.json";
+}
+static void Save() {
+    FILE* f = fopen(CfgPath().c_str(), "w"); if (!f) return;
+    fprintf(f, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"maxd\":%g,\"thick\":%g,"
+               "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g,\"t0\":%g,\"t1\":%g,\"t2\":%g,\"t3\":%g}",
+            C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.maxd, C.thick,
+            C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3], C.tcol[0], C.tcol[1], C.tcol[2], C.tcol[3]);
+    fclose(f);
+}
+static void Load() {
+    FILE* f = fopen(CfgPath().c_str(), "r"); if (!f) return;
+    char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
+    auto g = [&](const char* k, float d) { auto p = s.find(std::string("\"") + k + "\":"); return p == std::string::npos ? d : (float)atof(s.c_str() + p + strlen(k) + 3); };
+    C.esp = g("esp", 1); C.box = g("box", 1); C.hp = g("hp", 1); C.name = g("name", 1); C.dist = g("dist", 1);
+    C.lines = g("lines", 0); C.team = g("team", 1); C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+    const char* e[] = {"e0", "e1", "e2", "e3"}; const char* t[] = {"t0", "t1", "t2", "t3"};
+    for (int i = 0; i < 4; i++) { C.ecol[i] = g(e[i], C.ecol[i]); C.tcol[i] = g(t[i], C.tcol[i]); }
+}
+
+// ---------- shared snapshot (game thread writes, render thread reads) ----------
+struct Ent { ImVec2 head, feet; int hp; float dist; bool enemy; char name[40]; };
+static std::mutex g_mx;
+static std::vector<Ent> g_ents;
+static struct { bool down = false; float x = 0, y = 0; } g_touch; // y raw, bottom-up
+
+// ---------- game side ----------
+static Il2CppClass *kPC, *kComp, *kCam, *kTr, *kObj, *kInput, *kPhView, *kPlayer;
+static MethodInfo *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
+                  *mNick, *mProps, *mItem;
+static int oView, oPlayer, oDead;
+static Il2CppObject* g_pcType;
+static Il2CppArray* g_arr; static int g_tick;
+
+static int TeamOf(Il2CppObject* player) {
+    if (!player) return 0;
+    auto ht = Inv(mProps, player); if (!ht) return 0;
+    auto k = il2cpp_object_get_class(ht);
+    static MethodInfo* get = nullptr; if (!get) get = Meth(k, "get_Item", 1);
+    void* a[1] = {il2cpp_string_new("team")};
+    auto v = Inv(get, ht, a); if (!v) return 0;
+    const char* cn = il2cpp_class_get_name(il2cpp_object_get_class(v));
+    if (!strcmp(cn, "String")) { auto s = Str((Il2CppString*)v); return s == "CT" ? 1 : s == "TR" ? 2 : 0; }
+    return Unbox<unsigned char>(v); // Byte/enum boxed
+}
+static bool Pos(void* go, float* o) {
+    auto tr = Inv(mGetTr, go); if (!tr) return false;
+    auto p = Inv(mGetPos, tr); if (!p) return false; memcpy(o, (char*)p + 0x10, 12); return true;
+}
+static bool W2S(void* cam, float x, float y, float z, ImVec2& out) {
+    float v[3] = {x, y, z}; void* a[1] = {v};
+    auto r = Inv(mW2S, cam, a); if (!r) return false;
+    float* s = (float*)((char*)r + 0x10); if (s[2] <= 0.f) return false;
+    out = ImVec2(s[0], s[1]); return true; // y still bottom-up, flipped at draw
+}
+static void Collect() {
+    if (!g_pcType) { /* no player data, still pump touch below */ }
+    if (g_pcType && (!g_arr || (g_tick++ % 30) == 0)) {
+        bool inc = false; void* a[2] = {g_pcType, &inc};
+        g_arr = (Il2CppArray*)Inv(mFind, nullptr, a);
+    }
+    std::vector<Ent> out;
+    if (g_arr) {
+        void* local = nullptr; int myTeam = 0; float lp[3] = {};
+        for (uintptr_t i = 0; i < g_arr->len; i++) {
+            void* pc = g_arr->items[i]; if (!pc) continue;
+            auto view = Fld<Il2CppObject*>(pc, oView);
+            if (view && Unbox<bool>(Inv(mIsMine, view))) {
+                local = pc; myTeam = TeamOf(Fld<Il2CppObject*>(pc, oPlayer)); Pos(pc, lp); break;
+            }
+        }
+        auto cam = Inv(mCamMain, nullptr);
+        if (local && cam) for (uintptr_t i = 0; i < g_arr->len; i++) {
+            void* pc = g_arr->items[i]; if (!pc || pc == local) continue;
+            if (Fld<bool>(pc, oDead)) continue;
+            float p[3]; if (!Pos(pc, p)) continue;
+            Ent e{}; if (!W2S(cam, p[0], p[1], p[2], e.feet) || !W2S(cam, p[0], p[1] + 1.8f, p[2], e.head)) continue;
+            e.dist = sqrtf(powf(p[0] - lp[0], 2) + powf(p[1] - lp[1], 2) + powf(p[2] - lp[2], 2));
+            e.hp = Unbox<int>(Inv(mHealth, pc));
+            auto pl = Fld<Il2CppObject*>(pc, oPlayer);
+            int t = TeamOf(pl); e.enemy = !(C.team && t && t == myTeam);
+            snprintf(e.name, sizeof e.name, "%s", Str((Il2CppString*)Inv(mNick, pl)).c_str());
+            out.push_back(e);
+        }
+    }
+    // touch (legacy Input, main thread only)
+    bool down = false; float tx = 0, ty = 0;
+    int n = Unbox<int>(Inv(mTouchCnt, nullptr));
+    if (n > 0) { int idx = 0; void* a[1] = {&idx}; auto t = Inv(mGetTouch, nullptr, a);
+        if (t) { float* f = (float*)((char*)t + 0x10); tx = f[1]; ty = f[2]; int ph = *(int*)&f[9]; down = ph != 3 && ph != 4; } }
+    std::lock_guard<std::mutex> l(g_mx); g_ents.swap(out); g_touch = {down, tx, ty};
+}
+static void (*orig_update)(void*, MethodInfo*); static MethodInfo* mUpdate;
+static void (*orig_es)(void*, MethodInfo*); static MethodInfo* mEs;
+static void Tick() { // main thread only, ~120Hz max
+    if (gettid() != getpid()) return;
+    static auto last = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now();
+    if (now - last > std::chrono::milliseconds(8)) { last = now; Collect(); }
+}
+static void hook_update(void* self, MethodInfo* mi) { Tick(); orig_update(self, mi); }
+static void hook_es(void* self, MethodInfo* mi) { Tick(); orig_es(self, mi); } // EventSystem.Update: runs in lobby too, keeps touch alive
+
+// ---------- render side ----------
+static void Draw(int w, int h) {
+    auto dl = ImGui::GetBackgroundDrawList();
+    std::vector<Ent> es; { std::lock_guard<std::mutex> l(g_mx); es = g_ents; }
+    for (auto& e : es) {
+        if (e.dist > C.maxd) continue;
+        float fy = h - e.feet.y, hy = h - e.head.y, bh = fy - hy, bw = bh * .5f, cx = e.head.x;
+        if (bh < 4) continue;
+        ImU32 col = ImGui::ColorConvertFloat4ToU32(*(ImVec4*)(e.enemy ? C.ecol : C.tcol));
+        if (C.lines) dl->AddLine(ImVec2(w * .5f, (float)h), ImVec2(cx, fy), col, C.thick);
+        if (C.box) dl->AddRect(ImVec2(cx - bw / 2, hy), ImVec2(cx + bw / 2, fy), col, 0, 0, C.thick);
+        if (C.hp) {
+            float f = fminf(fmaxf(e.hp / 100.f, 0), 1), x = cx - bw / 2 - 6;
+            dl->AddRectFilled(ImVec2(x - 2, hy), ImVec2(x + 2, fy), IM_COL32(0, 0, 0, 160));
+            dl->AddRectFilled(ImVec2(x - 2, fy - bh * f), ImVec2(x + 2, fy), IM_COL32((int)(255 * (1 - f)), (int)(255 * f), 0, 255));
+        }
+        if (C.name) dl->AddText(ImVec2(cx - ImGui::CalcTextSize(e.name).x / 2, hy - ImGui::GetFontSize() - 2), col, e.name);
+        if (C.dist) { char b[16]; snprintf(b, 16, "%dm", (int)e.dist); dl->AddText(ImVec2(cx - ImGui::CalcTextSize(b).x / 2, fy + 2), col, b); }
+    }
+}
+static void Menu() {
+    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver); ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+    ImGui::Begin("esp", &g_menu);
+    if (ImGui::BeginTabBar("t")) {
+        if (ImGui::BeginTabItem("ESP")) {
+            ImGui::Checkbox("enable", &C.esp); ImGui::Checkbox("box", &C.box); ImGui::Checkbox("health", &C.hp);
+            ImGui::Checkbox("name", &C.name); ImGui::Checkbox("distance", &C.dist); ImGui::Checkbox("snaplines", &C.lines);
+            ImGui::Checkbox("team check", &C.team); ImGui::SliderFloat("max dist", &C.maxd, 20, 500); ImGui::SliderFloat("thickness", &C.thick, 1, 5);
+            ImGui::ColorEdit4("enemy", C.ecol, ImGuiColorEditFlags_NoInputs); ImGui::ColorEdit4("team", C.tcol, ImGuiColorEditFlags_NoInputs);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("CONFIG")) { if (ImGui::Button("save")) Save(); ImGui::SameLine(); if (ImGui::Button("load")) Load(); ImGui::EndTabItem(); }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+}
+static bool g_init; static int g_w, g_h;
+static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface);
+static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
+    EGLint w = 0, h = 0; eglQuerySurface(d, s, EGL_WIDTH, &w); eglQuerySurface(d, s, EGL_HEIGHT, &h);
+    if (w < 100 || h < 100) return orig_swap(d, s);
+    if (!g_init) {
+        ImGui::CreateContext(); auto& io = ImGui::GetIO(); io.IniFilename = nullptr;
+        ImGui::StyleColorsDark(); ImGui::GetStyle().ScaleAllSizes(3.f); io.FontGlobalScale = 2.6f;
+        ImGui_ImplOpenGL3_Init("#version 300 es"); Load(); g_init = true; LOG("imgui init %dx%d", w, h);
+    }
+    auto& io = ImGui::GetIO(); io.DisplaySize = ImVec2((float)w, (float)h);
+    { std::lock_guard<std::mutex> l(g_mx); io.AddMousePosEvent(g_touch.x, h - g_touch.y); io.AddMouseButtonEvent(0, g_touch.down); }
+    ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
+    if (C.esp) Draw(w, h);
+    ImGui::SetNextWindowPos(ImVec2(w - 200.f, 10)); ImGui::SetNextWindowBgAlpha(.3f);
+    ImGui::Begin("##tog", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+    if (ImGui::Button("MENU")) g_menu = !g_menu; ImGui::End();
+    if (g_menu) Menu();
+    ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    return orig_swap(d, s);
+}
+
+// ---------- bootstrap ----------
+static void* Boot(void*) {
+    LOG("boot");
+    void* egl = dlsym(dlopen("libEGL.so", RTLD_NOW), "eglSwapBuffers");
+    if (egl) { A64HookFunction(egl, (void*)hook_swap, (void**)&orig_swap); LOG("swap hooked %p", egl); } else LOG("eglSwapBuffers not found");
+    void* h = nullptr;
+    while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD)) || !ResolveApi(h)) sleep(1);
+    LOG("il2cpp api ok");
+    while (!(g_dom = il2cpp_domain_get())) sleep(1);
+    sleep(10); il2cpp_thread_attach(g_dom);
+    kPC = Cls("", "PlayerController"); kComp = Cls("UnityEngine", "Component"); kCam = Cls("UnityEngine", "Camera");
+    kTr = Cls("UnityEngine", "Transform"); kObj = Cls("UnityEngine", "Object"); kInput = Cls("UnityEngine", "Input");
+    kPhView = Cls("Photon.Pun", "PhotonView"); kPlayer = Cls("Photon.Realtime", "Player");
+    mFind = Meth(kObj, "FindObjectsOfType", 2); mGetTr = Meth(kComp, "get_transform", 0); mGetPos = Meth(kTr, "get_position", 0);
+    mCamMain = Meth(kCam, "get_main", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
+    mTouchCnt = Meth(kInput, "get_touchCount", 0); mGetTouch = Meth(kInput, "GetTouch", 1);
+    mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
+    mNick = Meth(kPlayer, "get_NickName", 0); mProps = Meth(kPlayer, "get_CustomProperties", 0);
+    oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath");
+    LOG("resolve PC=%p find=%p w2s=%p touch=%p/%p isMine=%p nick=%p props=%p off=%d/%d/%d",
+        kPC, mFind, mW2S, mTouchCnt, mGetTouch, mIsMine, mNick, mProps, oView, oPlayer, oDead);
+    if (!kPC || !mFind || !mW2S || oView < 0 || oPlayer < 0 || oDead < 0) { LOG("resolve failed, menu only"); }
+    else g_pcType = il2cpp_type_get_object(il2cpp_class_get_type(kPC));
+    mEs = Meth(Cls("UnityEngine.EventSystems", "EventSystem"), "Update", 0);
+    if (mEs) { A64HookFunction(mEs->methodPointer, (void*)hook_es, (void**)&orig_es); LOG("EventSystem.Update hooked"); }
+    mUpdate = Meth(kPC, "Update", 0);
+    if (mUpdate) { A64HookFunction(mUpdate->methodPointer, (void*)hook_update, (void**)&orig_update); LOG("PlayerController.Update hooked"); }
+    return nullptr;
+}
+static void Start() { static bool once; if (once) return; once = true; pthread_t t; pthread_create(&t, nullptr, Boot, nullptr); }
+__attribute__((constructor)) static void Ctor() { Start(); }               // LD_PRELOAD path
+JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) { Start(); return JNI_VERSION_1_6; } // System.loadLibrary path
