@@ -2,6 +2,8 @@
 #include <jni.h>
 #include <android/log.h>
 #include <stdint.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <dlfcn.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -87,26 +89,35 @@ struct Cfg {
     float maxd = 200, thick = 2;
 } C;
 static bool g_menu = true;
-static std::string CfgPath() {
+static std::string g_cfgMsg = "not saved yet";
+static std::vector<std::string> CfgPaths() {
     char b[128] = {}; FILE* f = fopen("/proc/self/cmdline", "r"); if (f) { fread(b, 1, 127, f); fclose(f); }
-    return std::string("/data/data/") + b + "/files/esp.json";
+    std::string pkg = b;
+    return {"/data/data/" + pkg + "/files/esp.json", "/storage/emulated/0/Android/data/" + pkg + "/files/esp.json", "/data/data/" + pkg + "/esp.json"};
 }
 static void Save() {
-    FILE* f = fopen(CfgPath().c_str(), "w"); if (!f) return;
-    fprintf(f, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"maxd\":%g,\"thick\":%g,"
-               "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g,\"t0\":%g,\"t1\":%g,\"t2\":%g,\"t3\":%g}",
-            C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.maxd, C.thick,
-            C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3], C.tcol[0], C.tcol[1], C.tcol[2], C.tcol[3]);
-    fclose(f);
+    char buf[700];
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"maxd\":%g,\"thick\":%g,"
+             "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+    for (auto& p : CfgPaths()) {
+        mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
+        FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
+        fputs(buf, f); fclose(f); g_cfgMsg = "saved: " + p; LOG("%s", g_cfgMsg.c_str()); return;
+    }
+    g_cfgMsg = std::string("SAVE FAILED, errno ") + std::to_string(errno); LOG("%s", g_cfgMsg.c_str());
 }
 static void Load() {
-    FILE* f = fopen(CfgPath().c_str(), "r"); if (!f) return;
-    char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
-    auto g = [&](const char* k, float d) { auto p = s.find(std::string("\"") + k + "\":"); return p == std::string::npos ? d : (float)atof(s.c_str() + p + strlen(k) + 3); };
-    C.esp = g("esp", 1); C.box = g("box", 1); C.hp = g("hp", 1); C.name = g("name", 1); C.dist = g("dist", 1);
-    C.lines = g("lines", 0); C.team = g("team", 1); C.maxd = g("maxd", 200); C.thick = g("thick", 2);
-    const char* e[] = {"e0", "e1", "e2", "e3"}; const char* t[] = {"t0", "t1", "t2", "t3"};
-    for (int i = 0; i < 4; i++) { C.ecol[i] = g(e[i], C.ecol[i]); C.tcol[i] = g(t[i], C.tcol[i]); }
+    for (auto& p : CfgPaths()) {
+        FILE* f = fopen(p.c_str(), "r"); if (!f) continue;
+        char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
+        auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
+        C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
+        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+        const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
+        g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
+    }
+    g_cfgMsg = "no saved config found";
 }
 
 // ---------- shared snapshot (game thread writes, render thread reads) ----------
@@ -124,7 +135,7 @@ static int oView, oPlayer, oDead, oCam;
 static Il2CppObject* g_pcType;
 static Il2CppArray* g_arr; static int g_tick;
 
-static int TeamOf(Il2CppObject* player) {
+static int TeamOf(Il2CppObject* player) { // any value type: equal value == same team
     if (!player) return 0;
     auto ht = Inv(mProps, player); if (!ht) return 0;
     auto k = il2cpp_object_get_class(ht);
@@ -132,8 +143,12 @@ static int TeamOf(Il2CppObject* player) {
     void* a[1] = {il2cpp_string_new("team")};
     auto v = Inv(get, ht, a); if (!v) return 0;
     const char* cn = il2cpp_class_get_name(il2cpp_object_get_class(v));
-    if (!strcmp(cn, "String")) { auto s = Str((Il2CppString*)v); return s == "CT" ? 1 : s == "TR" ? 2 : 0; }
-    return Unbox<unsigned char>(v); // Byte/enum boxed
+    if (!strcmp(cn, "String")) {
+        auto s = Str((Il2CppString*)v); if (s.empty()) return 0;
+        unsigned h = 5381; for (unsigned char ch : s) h = h * 33 + ch; return (int)(h | 1);
+    }
+    if (!strcmp(cn, "Byte")) return Unbox<unsigned char>(v);
+    return Unbox<int>(v); // Int32 / Team enum
 }
 static bool Pos(void* go, float* o) {
     auto tr = Inv(mGetTr, go); if (!tr) return false;
@@ -151,7 +166,7 @@ static int HP(Il2CppObject* o) {
 }
 static uint32_t g_arrH;
 static void Collect() {
-    static int logn = 0; void* dbgLocal = nullptr; void* dbgCam = nullptr;
+    static int logn = 0; void* dbgLocal = nullptr; void* dbgCam = nullptr; int hidden = 0, dbgTeam = 0;
     if (g_pcType && (!g_arr || (g_tick++ % 30) == 0)) {
         bool inc = false; void* a[2] = {g_pcType, &inc};
         auto arr = (Il2CppArray*)Inv(mFind, nullptr, a);
@@ -169,7 +184,7 @@ static void Collect() {
         Il2CppObject* cam = (local && oCam >= 0) ? Fld<Il2CppObject*>(local, oCam) : nullptr;
         if (!cam) cam = Inv(mCamMain, nullptr);
         if (cam && !haveLp) haveLp = Pos(cam, lp);           // no local player found: measure from the camera
-        dbgLocal = local; dbgCam = cam;
+        dbgLocal = local; dbgCam = cam; dbgTeam = myTeam;
         if (cam && haveLp) for (uintptr_t i = 0; i < g_arr->len; i++) {
             void* pc = g_arr->items[i]; if (!pc || pc == local) continue;
             if (Fld<bool>(pc, oDead)) continue;
@@ -180,14 +195,15 @@ static void Collect() {
             if (!W2S(cam, p[0], p[1], p[2], e.feet) || !W2S(cam, p[0], p[1] + 1.8f, p[2], e.head)) continue;
             e.hp = HP(Inv(mHealth, pc));
             auto pl = Fld<Il2CppObject*>(pc, oPlayer);
-            int t = TeamOf(pl); e.enemy = !(C.team && t && t == myTeam);
+            int t = TeamOf(pl); e.enemy = true;
+            if (C.team && myTeam && t == myTeam) { hidden++; continue; }   // teammate
             snprintf(e.name, sizeof e.name, "%s", Str((Il2CppString*)Inv(mNick, pl)).c_str());
             out.push_back(e);
         }
     }
-    if ((logn++ % 250) == 0) LOG("collect: players=%lu local=%p cam=%p drawn=%lu", g_arr ? (unsigned long)g_arr->len : 0UL, dbgLocal, dbgCam, (unsigned long)out.size());
+    if ((logn++ % 250) == 0) LOG("collect: players=%lu local=%p cam=%p drawn=%lu myTeam=%d hiddenTeam=%d", g_arr ? (unsigned long)g_arr->len : 0UL, dbgLocal, dbgCam, (unsigned long)out.size(), dbgTeam, hidden);
     // touch (legacy Input, main thread only)
-    bool down = false; float tx = 0, ty = 0;
+    static float tx = 0, ty = 0; bool down = false;
     int n = Unbox<int>(Inv(mTouchCnt, nullptr));
     if (n > 0) { int idx = 0; void* a[1] = {&idx}; auto t = Inv(mGetTouch, nullptr, a);
         static int dbg = 0; if (dbg++ < 5) LOG("touch n=%d obj=%p", n, (void*)t);
@@ -232,11 +248,16 @@ static void Menu() {
         if (ImGui::BeginTabItem("ESP")) {
             ImGui::Checkbox("enable", &C.esp); ImGui::Checkbox("box", &C.box); ImGui::Checkbox("health", &C.hp);
             ImGui::Checkbox("name", &C.name); ImGui::Checkbox("distance", &C.dist); ImGui::Checkbox("snaplines", &C.lines);
-            ImGui::Checkbox("team check", &C.team); ImGui::SliderFloat("max dist", &C.maxd, 20, 500); ImGui::SliderFloat("thickness", &C.thick, 1, 5);
-            ImGui::ColorEdit4("enemy", C.ecol, ImGuiColorEditFlags_NoInputs); ImGui::ColorEdit4("team", C.tcol, ImGuiColorEditFlags_NoInputs);
+            ImGui::Checkbox("hide teammates", &C.team); ImGui::SliderFloat("max dist", &C.maxd, 20, 500); ImGui::SliderFloat("thickness", &C.thick, 1, 5);
+            ImGui::ColorEdit4("enemy", C.ecol, ImGuiColorEditFlags_NoInputs);
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("CONFIG")) { if (ImGui::Button("save")) Save(); ImGui::SameLine(); if (ImGui::Button("load")) Load(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("CONFIG")) {
+            if (ImGui::Button("SAVE")) Save(); ImGui::SameLine(); if (ImGui::Button("LOAD")) Load(); ImGui::SameLine();
+            if (ImGui::Button("RESET")) { C = Cfg(); g_cfgMsg = "defaults restored"; }
+            ImGui::TextWrapped("%s", g_cfgMsg.c_str());
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::End();
