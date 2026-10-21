@@ -210,7 +210,8 @@ static void Draw(int w, int h) {
 }
 static void Menu() {
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver); ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
-    ImGui::Begin("esp", &g_menu);
+    ImGui::SetNextWindowBgAlpha(.88f);
+    ImGui::Begin("esp", &g_menu, ImGuiWindowFlags_NoSavedSettings);
     if (ImGui::BeginTabBar("t")) {
         if (ImGui::BeginTabItem("ESP")) {
             ImGui::Checkbox("enable", &C.esp); ImGui::Checkbox("box", &C.box); ImGui::Checkbox("health", &C.hp);
@@ -222,6 +223,26 @@ static void Menu() {
         if (ImGui::BeginTabItem("CONFIG")) { if (ImGui::Button("save")) Save(); ImGui::SameLine(); if (ImGui::Button("load")) Load(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
+    ImGui::End();
+}
+// floating bubble: drag anywhere on screen, tap toggles the menu
+static void Bubble(float w, float h) {
+    const float R = 70.f; static ImVec2 pos(w - 2 * R - 30.f, 160.f); static bool moved = false;
+    auto& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(pos); ImGui::SetNextWindowSize(ImVec2(2 * R, 2 * R));
+    ImGui::Begin("##bubble", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::InvisibleButton("b", ImVec2(2 * R, 2 * R));
+    if (ImGui::IsItemActivated()) moved = false;
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0, 12.f)) {
+        moved = true; pos.x += io.MouseDelta.x; pos.y += io.MouseDelta.y;
+        pos.x = fminf(fmaxf(pos.x, 0), w - 2 * R); pos.y = fminf(fmaxf(pos.y, 0), h - 2 * R);
+    }
+    if (ImGui::IsItemDeactivated() && !moved) g_menu = !g_menu;
+    auto dl = ImGui::GetWindowDrawList(); ImVec2 c(pos.x + R, pos.y + R);
+    dl->AddCircleFilled(c, R, g_menu ? IM_COL32(60, 140, 255, 220) : IM_COL32(30, 30, 30, 200), 48);
+    dl->AddCircle(c, R, IM_COL32(255, 255, 255, 200), 48, 3.f);
+    ImVec2 ts = ImGui::CalcTextSize("ESP"); dl->AddText(ImVec2(c.x - ts.x / 2, c.y - ts.y / 2), IM_COL32_WHITE, "ESP");
     ImGui::End();
 }
 static bool g_init; static int g_w, g_h;
@@ -238,9 +259,7 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     { std::lock_guard<std::mutex> l(g_mx); io.AddMousePosEvent(g_touch.x, h - g_touch.y); io.AddMouseButtonEvent(0, g_touch.down); }
     ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
     if (C.esp) Draw(w, h);
-    ImGui::SetNextWindowPos(ImVec2(w - 200.f, 10)); ImGui::SetNextWindowBgAlpha(.3f);
-    ImGui::Begin("##tog", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
-    if (ImGui::Button("MENU")) g_menu = !g_menu; ImGui::End();
+    Bubble((float)w, (float)h);
     if (g_menu) Menu();
     ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     return orig_swap(d, s);
@@ -255,7 +274,8 @@ static void* Boot(void*) {
     while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD)) || !ResolveApi(h)) sleep(1);
     LOG("il2cpp api ok");
     while (!(g_dom = il2cpp_domain_get())) sleep(1);
-    sleep(10); il2cpp_thread_attach(g_dom);
+    il2cpp_thread_attach(g_dom);
+    for (int i = 0; i < 60 && !Cls("", "PlayerController"); i++) sleep(1); // wait until game code is loaded, not a fixed delay
     kPC = Cls("", "PlayerController"); kComp = Cls("UnityEngine", "Component"); kCam = Cls("UnityEngine", "Camera");
     kTr = Cls("UnityEngine", "Transform"); kObj = Cls("UnityEngine", "Object"); kInput = Cls("UnityEngine", "Input");
     kPhView = Cls("Photon.Pun", "PhotonView"); kPlayer = Cls("Photon.Realtime", "Player");
