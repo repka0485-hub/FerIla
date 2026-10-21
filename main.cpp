@@ -188,6 +188,7 @@ static void Skel(void* pc, void* cam, Ent& e) {
             void* p = sc.tr[i];
             for (int d = 0; d < 8 && p; d++) { p = Inv(mGetParent, p); int j = p ? idxOf(p) : -1; if (j >= 0) { sc.par[i] = j; break; } }
         }
+        { int links = 0; for (int p : sc.par) if (p >= 0) links++; LOG("skeleton built: bones=%lu links=%d from=%s", (unsigned long)sc.tr.size(), links, arr ? "ragdoll[]" : "7 named"); }
         it = g_skel.insert_or_assign(pc, std::move(sc)).first;
     }
     auto& sc = it->second;
@@ -366,7 +367,7 @@ static void* Boot(void*) {
     mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
     mNick = Meth(kPlayer, "get_NickName", 0); mProps = Meth(kPlayer, "get_CustomProperties", 0);
     oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath"); oCam = Off(kPC, "_mainCamera");
-    { auto kPAC = Cls("", "PlayerAnimatorController"); auto kSk = Cls("", "PlayerSkeleton");
+    { auto kPAC = Cls("ScarletWork.Photon.TPS", "PlayerAnimatorController"); auto kSk = Cls("ScarletWork.Game", "PlayerSkeleton");   // namespaces from the dump
       oAnim = Off(kPC, "_animatorController"); oSkel = Off(kPAC, "_skeleton"); oSkelCt = Off(kPAC, "_ctSkeleton"); oSkelTr = Off(kPAC, "_trSkeleton");
       oRag = Off(kSk, "ragdollRigidbodies");
       const char* bn[7] = {"_headBone", "_chestBone", "_pelvisBone", "_leftUpperArm", "_rightUpperArm", "_leftThigh", "_rightThigh"};
