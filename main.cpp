@@ -87,7 +87,8 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true, bhop = false;
+    float bspeed = 1.5f, bjump = 6.f;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
     float maxd = 200, thick = 2, afov = 10;
     int abone = 0;
@@ -100,10 +101,10 @@ static std::vector<std::string> CfgPaths() {
     return {"/data/data/" + pkg + "/files/esp.json", "/storage/emulated/0/Android/data/" + pkg + "/files/esp.json", "/data/data/" + pkg + "/esp.json"};
 }
 static void Save() {
-    char buf[900];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,"
+    char buf[1000];
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,\"bhop\":%d,\"bspeed\":%g,\"bjump\":%g,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.bhop, C.bspeed, C.bjump, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -118,6 +119,7 @@ static void Load() {
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
         C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.saim = g("saim", 0) != 0; C.adraw = g("adraw", 1) != 0; C.abone = (int)g("abone", 0); C.afov = g("afov", 10); C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+        C.bhop = g("bhop", 0) != 0; C.bspeed = g("bspeed", 1.5f); C.bjump = g("bjump", 6.f);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -333,6 +335,12 @@ static void Menu() {
             ImGui::TextWrapped("recoil: camera kick and spray pattern. scatter: random bullet spread.");
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("MOVE")) {
+            ImGui::Checkbox("bhop", &C.bhop); ImGui::SliderFloat("bhop speed", &C.bspeed, 1, 3, "x%.2f");
+            ImGui::SliderFloat("jump power (fallback)", &C.bjump, 3, 12, "%.1f");
+            ImGui::TextWrapped("bhop: re-jump on every landing while moving. speed: multiplier on the horizontal step. jump power is used only if the game's own jump method was not found (see logcat, tag ESP).");
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("CONFIG")) {
             if (ImGui::Button("SAVE")) Save(); ImGui::SameLine(); if (ImGui::Button("LOAD")) Load(); ImGui::SameLine();
             if (ImGui::Button("RESET")) { C = Cfg(); g_cfgMsg = "defaults restored"; }
@@ -472,6 +480,59 @@ static void* h_gns(void* s, bool cont, float t, MethodInfo* mi) { void* r = o_gn
 static void* (*o_gcd)(void*, float, MethodInfo*);                       // RecoilControl.GetCurrentDeviation(float)
 static void* h_gcd(void* s, float t, MethodInfo* mi) { void* r = o_gcd(s, t, mi); ZeroRD(r); return r; }
 
+// ---------- MOVE: bhop + bhop speed (hook CharacterController.Move on the local player) ----------
+static MethodInfo *mCCMove, *mCCGnd, *mRoot, *mJump, *mDt;
+static MethodInfo* (*il2cpp_class_get_methods)(Il2CppClass*, void**);
+static const char* (*il2cpp_method_get_name)(MethodInfo*);
+static uint32_t (*il2cpp_method_get_param_count)(MethodInfo*);
+static Il2CppClass* (*il2cpp_class_get_parent)(Il2CppClass*);
+static MethodInfo* FindJump(Il2CppClass* k) {   // exact "Jump" first (Boot), else first 0-arg non-accessor method with "jump" in its name, walking up the parents
+    if (!il2cpp_class_get_methods || !il2cpp_method_get_name || !il2cpp_method_get_param_count) return nullptr;
+    MethodInfo* best = nullptr;
+    for (int d = 0; k && d < 6; d++, k = il2cpp_class_get_parent ? il2cpp_class_get_parent(k) : nullptr) {
+        void* it = nullptr;
+        while (MethodInfo* m = il2cpp_class_get_methods(k, &it)) {
+            const char* n = il2cpp_method_get_name(m); if (!n || !m->methodPointer) continue;
+            std::string s = n; for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+            if (s.find("jump") == std::string::npos) continue;
+            uint32_t pc = il2cpp_method_get_param_count(m);
+            LOG("jump candidate %s::%s argc=%u", il2cpp_class_get_name(k), n, pc);
+            if (!best && pc == 0 && s.compare(0, 4, "get_") && s.compare(0, 4, "set_") && s.compare(0, 2, "is") && s.compare(0, 3, "can") && s.compare(0, 3, "has")) best = m;
+        }
+    }
+    return best;
+}
+static bool IsLocalCC(void* cc) {   // same root transform as the local PlayerController; cached per (cc, local)
+    static void *lc = nullptr, *ll = nullptr; static bool res = false;
+    if (cc != lc || g_local != ll) {
+        lc = cc; ll = g_local; res = false;
+        Il2CppObject* a = Inv(mGetTr, cc); Il2CppObject* b = Inv(mGetTr, g_local);
+        if (a && b) { if (mRoot) { a = Inv(mRoot, a); b = Inv(mRoot, b); } res = a && a == b; }
+    }
+    return res;
+}
+static int (*o_ccmove)(void*, V3, MethodInfo*);                         // CharacterController.Move(Vector3) -> CollisionFlags
+static int h_ccmove(void* s, V3 m, MethodInfo* mi) {
+    static float vy = 0; static bool air = false; static int seen = 0;
+    if (C.bhop && g_local && IsLocalCC(s)) {
+        if (seen++ < 3) LOG("bhop: local CharacterController.Move hit, gameJump=%p", (void*)mJump);
+        bool moving = m.x * m.x + m.z * m.z > 1e-8f;
+        bool gnd = mCCGnd && Unbox<bool>(Inv(mCCGnd, s));
+        if (moving) {
+            m.x *= C.bspeed; m.z *= C.bspeed;
+            if (gnd) { if (mJump) Inv(mJump, g_local); else { vy = C.bjump; air = true; } }
+        }
+        if (!mJump && air) {   // fallback: own vertical impulse on top of the game's gravity
+            if (gnd && !moving) air = false;
+            else {
+                float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
+                m.y += vy * dt; vy -= 9.81f * dt; if (vy <= 0) { vy = 0; air = false; }
+            }
+        }
+    }
+    return o_ccmove(s, m, mi);
+}
+
 static void* Boot(void*) {
     LOG("boot");
     void* egl = dlsym(dlopen("libEGL.so", RTLD_NOW), "eglSwapBuffers");
@@ -516,6 +577,15 @@ static void* Boot(void*) {
       if (c) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
       if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
       LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
+    { auto kCC = Cls("UnityEngine", "CharacterController");
+      mCCMove = Meth(kCC, "Move", 1); mCCGnd = Meth(kCC, "get_isGrounded", 0); mRoot = Meth(kTr, "get_root", 0); mDt = Meth(Cls("UnityEngine", "Time"), "get_deltaTime", 0);
+      il2cpp_class_get_methods = (decltype(il2cpp_class_get_methods))dlsym(h, "il2cpp_class_get_methods");
+      il2cpp_method_get_name = (decltype(il2cpp_method_get_name))dlsym(h, "il2cpp_method_get_name");
+      il2cpp_method_get_param_count = (decltype(il2cpp_method_get_param_count))dlsym(h, "il2cpp_method_get_param_count");
+      il2cpp_class_get_parent = (decltype(il2cpp_class_get_parent))dlsym(h, "il2cpp_class_get_parent");
+      mJump = Meth(kPC, "Jump", 0); if (!mJump) mJump = FindJump(kPC);
+      if (mCCMove) A64HookFunction(mCCMove->methodPointer, (void*)h_ccmove, (void**)&o_ccmove);
+      LOG("move hooks: ccMove=%p grounded=%p root=%p dt=%p jump=%p", (void*)mCCMove, (void*)mCCGnd, (void*)mRoot, (void*)mDt, (void*)mJump); }
     { auto kArms = Cls("", "ArmsController"); auto fr = Meth(kArms, "FireRay", 4); auto fp = Meth(kArms, "FirePellets", 5);
       if (fr) A64HookFunction(fr->methodPointer, (void*)h_fr, (void**)&o_fr);
       if (fp) A64HookFunction(fp->methodPointer, (void*)h_fp, (void**)&o_fp);
