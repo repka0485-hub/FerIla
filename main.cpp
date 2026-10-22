@@ -2,6 +2,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <stdint.h>
+#include <cctype>
 #include <errno.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -137,6 +138,8 @@ static MethodInfo *mCamFov, *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain
                   *mNick, *mProps, *mItem;
 static int oView, oPlayer, oDead, oCam, oAnim = -1, oSkel = -1, oSkelCt = -1, oSkelTr = -1, oRag = -1, oBone[7] = {-1, -1, -1, -1, -1, -1, -1};
 static MethodInfo* mGetParent;
+static MethodInfo *mGetBones, *mGetName;
+static int oBody = -1, oBodyLod = -1;
 static Il2CppObject* g_pcType;
 static Il2CppArray* g_arr; static int g_tick;
 
@@ -166,6 +169,15 @@ static bool W2S(void* cam, float x, float y, float z, ImVec2& out) {
     out = ImVec2(s[0], s[1]); return true; // y still bottom-up, flipped at draw
 }
 // skeleton = lines between ragdoll bones, parent link = nearest ancestor transform that is also a bone
+// bones we do not want to draw (fingers, toes, twist/helper bones, ik targets...)
+static bool SkipBone(void* t) {
+    if (!mGetName) return false;
+    auto n = (Il2CppString*)Inv(mGetName, t); if (!n) return false;
+    std::string s = Str(n); for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+    static const char* bad[] = {"finger", "thumb", "index", "middle", "ring", "pinky", "toe", "twist", "roll", "helper", "nub", "eye", "jaw", "tongue", "hair", "ik", "pole", "socket", "weapon", "_end"};
+    for (auto b : bad) if (s.find(b) != std::string::npos) return true;
+    return false;
+}
 struct SkelC { void* anim = nullptr; void* skel = nullptr; std::vector<void*> tr; std::vector<int> par; };
 static std::unordered_map<void*, SkelC> g_skel;
 static void Skel(void* pc, void* cam, Ent& e) {
@@ -179,18 +191,28 @@ static void Skel(void* pc, void* cam, Ent& e) {
     if (it == g_skel.end() || it->second.anim != anim || it->second.skel != sk) {   // (re)build the bone list
         if (g_skel.size() > 64) g_skel.clear();
         SkelC sc; sc.anim = anim; sc.skel = sk;
-        std::vector<void*> rbs;
-        auto arr = oRag >= 0 ? Fld<Il2CppArray*>(sk, oRag) : nullptr;
-        if (arr) for (uintptr_t i = 0; i < arr->len && i < 40; i++) if (arr->items[i]) rbs.push_back(arr->items[i]);
-        if (rbs.empty()) for (int k = 0; k < 7; k++) if (oBone[k] >= 0) { void* r = Fld<void*>(sk, oBone[k]); if (r) rbs.push_back(r); }
-        for (void* r : rbs) { auto t = Inv(mGetTr, r); if (t) sc.tr.push_back(t); }
+        const char* src = "skinned body";
+        {   // main source: bone list of the skinned body mesh = the real armature
+            void* body = oBody >= 0 ? Fld<void*>(sk, oBody) : nullptr;
+            if (!body && oBodyLod >= 0) body = Fld<void*>(sk, oBodyLod);
+            auto ba = (body && mGetBones) ? (Il2CppArray*)Inv(mGetBones, body) : nullptr;
+            if (ba) for (uintptr_t i = 0; i < ba->len && i < 150; i++) { void* t = ba->items[i]; if (t && !SkipBone(t)) sc.tr.push_back(t); }
+        }
+        if (sc.tr.size() < 6) {   // fallback: ragdoll rigidbodies, then the 7 named bones
+            sc.tr.clear(); src = "ragdoll";
+            std::vector<void*> rbs;
+            auto arr = oRag >= 0 ? Fld<Il2CppArray*>(sk, oRag) : nullptr;
+            if (arr) for (uintptr_t i = 0; i < arr->len && i < 40; i++) if (arr->items[i]) rbs.push_back(arr->items[i]);
+            if (rbs.empty()) { src = "7 named"; for (int k = 0; k < 7; k++) if (oBone[k] >= 0) { void* r = Fld<void*>(sk, oBone[k]); if (r) rbs.push_back(r); } }
+            for (void* r : rbs) { auto t = Inv(mGetTr, r); if (t) sc.tr.push_back(t); }
+        }
         sc.par.assign(sc.tr.size(), -1);
         auto idxOf = [&](void* p) { for (size_t j = 0; j < sc.tr.size(); j++) if (sc.tr[j] == p) return (int)j; return -1; };
         for (size_t i = 0; i < sc.tr.size(); i++) {
             void* p = sc.tr[i];
-            for (int d = 0; d < 8 && p; d++) { p = Inv(mGetParent, p); int j = p ? idxOf(p) : -1; if (j >= 0) { sc.par[i] = j; break; } }
+            for (int d = 0; d < 14 && p; d++) { p = Inv(mGetParent, p); int j = p ? idxOf(p) : -1; if (j >= 0) { sc.par[i] = j; break; } }
         }
-        { int links = 0; for (int p : sc.par) if (p >= 0) links++; LOG("skeleton built: bones=%lu links=%d from=%s", (unsigned long)sc.tr.size(), links, arr ? "ragdoll[]" : "7 named"); }
+        { int links = 0; for (int p : sc.par) if (p >= 0) links++; LOG("skeleton built: bones=%lu links=%d from=%s", (unsigned long)sc.tr.size(), links, src); }
         it = g_skel.insert_or_assign(pc, std::move(sc)).first;
     }
     auto& sc = it->second;
@@ -472,10 +494,11 @@ static void* Boot(void*) {
     oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath"); oCam = Off(kPC, "_mainCamera");
     { auto kPAC = Cls("ScarletWork.Photon.TPS", "PlayerAnimatorController"); auto kSk = Cls("ScarletWork.Game", "PlayerSkeleton");   // namespaces from the dump
       oAnim = Off(kPC, "_animatorController"); oSkel = Off(kPAC, "_skeleton"); oSkelCt = Off(kPAC, "_ctSkeleton"); oSkelTr = Off(kPAC, "_trSkeleton");
-      oRag = Off(kSk, "ragdollRigidbodies");
+      oRag = Off(kSk, "ragdollRigidbodies"); oBody = Off(kSk, "_body"); oBodyLod = Off(kSk, "_bodyLod");
+      mGetBones = Meth(Cls("UnityEngine", "SkinnedMeshRenderer"), "get_bones", 0); mGetName = Meth(kObj, "get_name", 0);
       const char* bn[7] = {"_headBone", "_chestBone", "_pelvisBone", "_leftUpperArm", "_rightUpperArm", "_leftThigh", "_rightThigh"};
       for (int i = 0; i < 7; i++) oBone[i] = Off(kSk, bn[i]);
-      LOG("skeleton offsets anim=%d skel=%d rag=%d parent=%p", oAnim, oSkel, oRag, (void*)mGetParent); }
+      LOG("skeleton offsets anim=%d skel=%d rag=%d body=%d/%d parent=%p bones=%p name=%p", oAnim, oSkel, oRag, oBody, oBodyLod, (void*)mGetParent, (void*)mGetBones, (void*)mGetName); }
     LOG("resolve PC=%p find=%p w2s=%p touch=%p/%p isMine=%p nick=%p props=%p off=%d/%d/%d",
         kPC, mFind, mW2S, mTouchCnt, mGetTouch, mIsMine, mNick, mProps, oView, oPlayer, oDead);
     if (!kPC || !mFind || !mW2S || oView < 0 || oPlayer < 0 || oDead < 0) { LOG("resolve failed, menu only"); }
