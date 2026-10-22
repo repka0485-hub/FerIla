@@ -264,7 +264,7 @@ static void Collect() {
             auto pl = Fld<Il2CppObject*>(pc, oPlayer);
             int t = TeamOf(pl); e.enemy = true;
             if (C.team && myTeam && t == myTeam) { hidden++; continue; }   // teammate
-            snprintf(e.name, sizeof e.name, "%s", Str((Il2CppString*)Inv(mNick, pl)).c_str());
+            snprintf(e.name, sizeof e.name, "%s", pl ? Str((Il2CppString*)Inv(mNick, pl)).c_str() : "bot");   // _player is null for bots / not-yet-assigned spawns
             if (C.skel) Skel(pc, cam, e);
             out.push_back(e);
         }
@@ -367,12 +367,15 @@ static void Bubble(float w, float h) {
     ImVec2 ts = ImGui::CalcTextSize("ESP"); dl->AddText(ImVec2(c.x - ts.x / 2, c.y - ts.y / 2), IM_COL32_WHITE, "ESP");
     ImGui::End();
 }
-static bool g_init; static int g_w, g_h;
+static bool g_init; static int g_w, g_h; static EGLContext g_ctx = EGL_NO_CONTEXT;
 static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface);
 static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
     EGLint w = 0, h = 0; eglQuerySurface(d, s, EGL_WIDTH, &w); eglQuerySurface(d, s, EGL_HEIGHT, &h);
     if (w < 100 || h < 100) return orig_swap(d, s);
+    EGLContext cur = eglGetCurrentContext();
+    if (cur == EGL_NO_CONTEXT || (g_init && cur != g_ctx)) return orig_swap(d, s);   // other thread/surface (ads, webview): imgui GL objects are not valid there
     if (!g_init) {
+        g_ctx = cur;
         ImGui::CreateContext(); auto& io = ImGui::GetIO(); io.IniFilename = nullptr;
         ImGui::StyleColorsDark(); ImGui::GetStyle().ScaleAllSizes(3.f); io.FontGlobalScale = 2.6f;
         ImGui_ImplOpenGL3_Init("#version 300 es"); Load(); g_init = true; LOG("imgui init %dx%d", w, h);
@@ -548,6 +551,7 @@ static void DumpClass(Il2CppClass* k) {   // logcat: grep "ESP" | grep -E "fld |
     }
 }
 
+static void (*il2cpp_thread_detach)(void*);
 static void* Boot(void*) {
     LOG("boot");
     void* egl = dlsym(dlopen("libEGL.so", RTLD_NOW), "eglSwapBuffers");
@@ -556,7 +560,8 @@ static void* Boot(void*) {
     while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD)) || !ResolveApi(h)) sleep(1);
     LOG("il2cpp api ok");
     while (!(g_dom = il2cpp_domain_get())) sleep(1);
-    il2cpp_thread_attach(g_dom);
+    void* thr = il2cpp_thread_attach(g_dom);
+    il2cpp_thread_detach = (decltype(il2cpp_thread_detach))dlsym(h, "il2cpp_thread_detach");
     for (int i = 0; i < 60 && !Cls("", "PlayerController"); i++) sleep(1); // wait until game code is loaded, not a fixed delay
     kPC = Cls("", "PlayerController"); kComp = Cls("UnityEngine", "Component"); kCam = Cls("UnityEngine", "Camera");
     kTr = Cls("UnityEngine", "Transform"); kObj = Cls("UnityEngine", "Object"); kInput = Cls("UnityEngine", "Input");
@@ -578,7 +583,7 @@ static void* Boot(void*) {
     LOG("resolve PC=%p find=%p w2s=%p touch=%p/%p isMine=%p nick=%p props=%p off=%d/%d/%d",
         kPC, mFind, mW2S, mTouchCnt, mGetTouch, mIsMine, mNick, mProps, oView, oPlayer, oDead);
     if (!kPC || !mFind || !mW2S || oView < 0 || oPlayer < 0 || oDead < 0) { LOG("resolve failed, menu only"); }
-    else g_pcType = il2cpp_type_get_object(il2cpp_class_get_type(kPC));
+    else { g_pcType = il2cpp_type_get_object(il2cpp_class_get_type(kPC)); il2cpp_gchandle_new(g_pcType, false); }   // root it, we cache the raw pointer
     mEs = Meth(Cls("UnityEngine.EventSystems", "EventSystem"), "Update", 0);
     if (mEs) { A64HookFunction(mEs->methodPointer, (void*)hook_es, (void**)&orig_es); LOG("EventSystem.Update hooked"); }
     mUpdate = Meth(kPC, "Update", 0);
@@ -608,6 +613,8 @@ static void* Boot(void*) {
       if (b) A64HookFunction(b->methodPointer, (void*)h_gru, (void**)&o_gru);
       if (c) A64HookFunction(c->methodPointer, (void*)h_gat, (void**)&o_gat);
       LOG("gyro hooks: rate=%p unbiased=%p attitude=%p", (void*)a, (void*)b, (void*)c); }
+    if (il2cpp_thread_detach && thr) { il2cpp_thread_detach(thr); LOG("boot thread detached"); }
+    else for (;;) sleep(3600);   // no detach api: park the thread, never exit it attached
     return nullptr;
 }
 static void Start() { static bool once; if (once) return; once = true; pthread_t t; pthread_create(&t, nullptr, Boot, nullptr); }
