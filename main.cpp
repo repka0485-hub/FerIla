@@ -13,6 +13,7 @@
 #include <mutex>
 #include <vector>
 #include <utility>
+#include <initializer_list>
 #include <unordered_map>
 #include <string>
 #include <chrono>
@@ -444,14 +445,16 @@ static bool PickTarget(V3 cam, V3 fwd, V3* out) {
 }
 static void (*o_fr)(void*, V3, V3, float, bool, MethodInfo*);            // ArmsController.FireRay(camPos, forward, distance, isKnife)
 static void h_fr(void* s, V3 cam, V3 fwd, float dist, bool knife, MethodInfo* mi) {
-    V3 t; if (C.saim && !knife && PickTarget(cam, fwd, &t)) fwd = Norm(Sub(t, cam));
+    V3 t; bool got = C.saim && !knife && PickTarget(cam, fwd, &t); if (got) fwd = Norm(Sub(t, cam));
+    { static int n = 0; if (n++ < 10) LOG("FireRay: saim=%d knife=%d target=%d", C.saim, knife, got); }
     o_fr(s, cam, fwd, dist, knife, mi);
 }
 static void (*o_fp)(void*, void*, V3, Q4, float, int, MethodInfo*);     // ArmsController.FirePellets(params, origin, aim, distance, pellets)
 static void h_fp(void* s, void* prm, V3 org, Q4 aim, float dist, int n, MethodInfo* mi) {
     if (C.saim) {
         V3 f = {2 * (aim.x * aim.z + aim.w * aim.y), 2 * (aim.y * aim.z - aim.w * aim.x), 1 - 2 * (aim.x * aim.x + aim.y * aim.y)}, t;
-        if (PickTarget(org, f, &t)) aim = LookRot(Norm(Sub(t, org)));
+        bool got = PickTarget(org, f, &t); if (got) aim = LookRot(Norm(Sub(t, org)));
+        static int n = 0; if (n++ < 10) LOG("FirePellets: target=%d", got);
     }
     o_fp(s, prm, org, aim, dist, n, mi);
 }
@@ -499,12 +502,37 @@ static void AimTick(void* self) {   // runs on the game thread right after the l
     float dp = tp - cpi;
     float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
     float f = C.asmooth <= 1.f ? 1.f : 1.f - expf(-dt * 40.f / C.asmooth);  // frame-rate independent
+    if (fabsf(dy) < 0.0087f && fabsf(dp) < 0.0087f) f = 1.f;                 // inside 0.5 deg: land exactly on the point
+    { static int n = 0; if (n++ < 12) LOG("aim tick: yaw %.2f->%.2f pitch %.2f->%.2f f=%.2f", cy * 57.3f, ty * 57.3f, cpi * 57.3f, tp * 57.3f, f); }
     float sy = dy * f, h = sy * .5f;
     Q4 qy = {0, sinf(h), 0, cosf(h)}, npr = QMul(qy, Unbox<Q4>(pr));         // yaw on the body: game's look code keeps it
     void* a1[1] = {&npr}; Inv(mSetRot, pt, a1);
     float ny = cy + sy, np = cpi + dp * f, c = cosf(np);
     Q4 nq = LookRot(V3{c * sinf(ny), sinf(np), c * cosf(ny)});               // camera: exact result incl. pitch
     void* a2[1] = {&nq}; Inv(mSetRot, ct, a2);
+}
+
+static void* (*il2cpp_class_get_fields)(Il2CppClass*, void**);
+static const char* (*il2cpp_field_get_name)(FieldInfo*);
+static Il2CppClass* (*il2cpp_class_get_parent)(Il2CppClass*);
+static MethodInfo* (*il2cpp_class_get_methods)(Il2CppClass*, void**);
+static const char* (*il2cpp_method_get_name)(MethodInfo*);
+static uint32_t (*il2cpp_method_get_param_count)(MethodInfo*);
+static bool Has(const char* n, std::initializer_list<const char*> ks) {
+    std::string s = n; for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
+    for (auto k : ks) if (s.find(k) != std::string::npos) return true; return false;
+}
+static void DumpClass(Il2CppClass* k) {   // logcat: grep "ESP" | grep -E "fld |mth "
+    if (!k || !il2cpp_class_get_fields || !il2cpp_class_get_methods) return;
+    for (int d = 0; k && d < 4; d++, k = il2cpp_class_get_parent ? il2cpp_class_get_parent(k) : nullptr) {
+        const char* cn = il2cpp_class_get_name(k); if (!strcmp(cn, "MonoBehaviour") || !strcmp(cn, "Behaviour")) break;
+        void* it = nullptr;
+        while (auto f = (FieldInfo*)il2cpp_class_get_fields(k, &it)) { const char* n = il2cpp_field_get_name(f);
+            if (n && Has(n, {"rot", "pitch", "yaw", "look", "angle", "cam", "aim", "sens", "mouse", "euler"})) LOG("fld %s::%s off=%d", cn, n, (int)il2cpp_field_get_offset(f)); }
+        it = nullptr;
+        while (auto m = il2cpp_class_get_methods(k, &it)) { const char* n = il2cpp_method_get_name(m);
+            if (n && Has(n, {"fire", "shoot", "bullet", "raycast", "hit", "look", "rotat", "aim"})) LOG("mth %s::%s argc=%u", cn, n, il2cpp_method_get_param_count(m)); }
+    }
 }
 
 static void* Boot(void*) {
@@ -552,6 +580,10 @@ static void* Boot(void*) {
       if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
       LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
     mGetRot = Meth(kTr, "get_rotation", 0); mSetRot = Meth(kTr, "set_rotation", 1); mDt = Meth(Cls("UnityEngine", "Time"), "get_deltaTime", 0);
+#define RS(n) n = (decltype(n))dlsym(h, #n);
+    RS(il2cpp_class_get_fields) RS(il2cpp_field_get_name) RS(il2cpp_class_get_parent) RS(il2cpp_class_get_methods) RS(il2cpp_method_get_name) RS(il2cpp_method_get_param_count)
+#undef RS
+    DumpClass(kPC); DumpClass(Cls("", "ArmsController"));
     LOG("aim: getRot=%p setRot=%p dt=%p cam=%d", (void*)mGetRot, (void*)mSetRot, (void*)mDt, oCam);
     { auto kArms = Cls("", "ArmsController"); auto fr = Meth(kArms, "FireRay", 4); auto fp = Meth(kArms, "FirePellets", 5);
       if (fr) A64HookFunction(fr->methodPointer, (void*)h_fr, (void**)&o_fr);
