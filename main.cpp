@@ -87,8 +87,8 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true, bhop = false;
-    float bspeed = 1.5f, bjump = 6.f;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true, aim = false;
+    float asmooth = 8.f;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
     float maxd = 200, thick = 2, afov = 10;
     int abone = 0;
@@ -102,9 +102,9 @@ static std::vector<std::string> CfgPaths() {
 }
 static void Save() {
     char buf[1000];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,\"bhop\":%d,\"bspeed\":%g,\"bjump\":%g,"
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,\"aim\":%d,\"asmooth\":%g,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.bhop, C.bspeed, C.bjump, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.aim, C.asmooth, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -119,7 +119,7 @@ static void Load() {
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
         C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.saim = g("saim", 0) != 0; C.adraw = g("adraw", 1) != 0; C.abone = (int)g("abone", 0); C.afov = g("afov", 10); C.maxd = g("maxd", 200); C.thick = g("thick", 2);
-        C.bhop = g("bhop", 0) != 0; C.bspeed = g("bspeed", 1.5f); C.bjump = g("bjump", 6.f);
+        C.aim = g("aim", 0) != 0; C.asmooth = g("asmooth", 8.f);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -284,7 +284,8 @@ static void Tick() { // called from Unity script thread (hooks), ~120Hz max
     static auto last = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now();
     if (now - last > std::chrono::milliseconds(8)) { last = now; Collect(); }
 }
-static void hook_update(void* self, MethodInfo* mi) { Tick(); orig_update(self, mi); }
+static void AimTick(void* self);
+static void hook_update(void* self, MethodInfo* mi) { Tick(); orig_update(self, mi); AimTick(self); }
 static void hook_es(void* self, MethodInfo* mi) { Tick(); orig_es(self, mi); } // EventSystem.Update: runs in lobby too, keeps touch alive
 
 // ---------- render side ----------
@@ -322,7 +323,7 @@ static void Menu() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("AIM")) {
-            ImGui::Checkbox("silent aim", &C.saim); ImGui::Checkbox("draw fov", &C.adraw);
+            ImGui::Checkbox("aim", &C.aim); ImGui::SliderFloat("smooth", &C.asmooth, 1, 30, "%.1f"); ImGui::Checkbox("silent aim", &C.saim); ImGui::Checkbox("draw fov", &C.adraw);
             ImGui::SliderFloat("fov", &C.afov, 1, 90, "%.0f deg");
             ImGui::TextUnformatted("hit place:");
             ImGui::RadioButton("head", &C.abone, 0); ImGui::SameLine(); ImGui::RadioButton("chest", &C.abone, 1);
@@ -333,12 +334,6 @@ static void Menu() {
         if (ImGui::BeginTabItem("MEMORY")) {
             ImGui::Checkbox("anti recoil", &C.noRecoil); ImGui::Checkbox("anti scatter", &C.noSpread);
             ImGui::TextWrapped("recoil: camera kick and spray pattern. scatter: random bullet spread.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("MOVE")) {
-            ImGui::Checkbox("bhop", &C.bhop); ImGui::SliderFloat("bhop speed", &C.bspeed, 1, 3, "x%.2f");
-            ImGui::SliderFloat("jump power (fallback)", &C.bjump, 3, 12, "%.1f");
-            ImGui::TextWrapped("bhop: re-jump on every landing while moving. speed: multiplier on the horizontal step. jump power is used only if the game's own jump method was not found (see logcat, tag ESP).");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("CONFIG")) {
@@ -387,7 +382,7 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
       io.AddMousePosEvent(g_touch.x * sx, h - g_touch.y * sy); io.AddMouseButtonEvent(0, g_touch.down); }
     ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
     if (C.esp) Draw(w, h, sx, sy);
-    if (C.saim && C.adraw) {   // fov circle: angular radius -> pixels through the camera fov
+    if ((C.saim || C.aim) && C.adraw) {   // fov circle: angular radius -> pixels through the camera fov
         float r = tanf(C.afov * 0.0174533f) / tanf(g_vfov * 0.5f * 0.0174533f) * (h * 0.5f); if (r > h) r = (float)h;
         ImGui::GetBackgroundDrawList()->AddCircle(ImVec2(w * .5f, h * .5f), r, IM_COL32(255, 255, 255, 170), 64, 2.f);
     }
@@ -480,57 +475,36 @@ static void* h_gns(void* s, bool cont, float t, MethodInfo* mi) { void* r = o_gn
 static void* (*o_gcd)(void*, float, MethodInfo*);                       // RecoilControl.GetCurrentDeviation(float)
 static void* h_gcd(void* s, float t, MethodInfo* mi) { void* r = o_gcd(s, t, mi); ZeroRD(r); return r; }
 
-// ---------- MOVE: bhop + bhop speed (hook CharacterController.Move on the local player) ----------
-static MethodInfo *mCCMove, *mCCGnd, *mRoot, *mJump, *mDt;
-static MethodInfo* (*il2cpp_class_get_methods)(Il2CppClass*, void**);
-static const char* (*il2cpp_method_get_name)(MethodInfo*);
-static uint32_t (*il2cpp_method_get_param_count)(MethodInfo*);
-static Il2CppClass* (*il2cpp_class_get_parent)(Il2CppClass*);
-static MethodInfo* FindJump(Il2CppClass* k) {   // exact "Jump" first (Boot), else first 0-arg non-accessor method with "jump" in its name, walking up the parents
-    if (!il2cpp_class_get_methods || !il2cpp_method_get_name || !il2cpp_method_get_param_count) return nullptr;
-    MethodInfo* best = nullptr;
-    for (int d = 0; k && d < 6; d++, k = il2cpp_class_get_parent ? il2cpp_class_get_parent(k) : nullptr) {
-        void* it = nullptr;
-        while (MethodInfo* m = il2cpp_class_get_methods(k, &it)) {
-            const char* n = il2cpp_method_get_name(m); if (!n || !m->methodPointer) continue;
-            std::string s = n; for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
-            if (s.find("jump") == std::string::npos) continue;
-            uint32_t pc = il2cpp_method_get_param_count(m);
-            LOG("jump candidate %s::%s argc=%u", il2cpp_class_get_name(k), n, pc);
-            if (!best && pc == 0 && s.compare(0, 4, "get_") && s.compare(0, 4, "set_") && s.compare(0, 2, "is") && s.compare(0, 3, "can") && s.compare(0, 3, "has")) best = m;
-        }
-    }
-    return best;
+// ---------- AIM: smooth aim = per frame, rotate the local view toward the picked target ----------
+static MethodInfo *mGetRot, *mSetRot, *mDt;
+static Q4 QMul(Q4 a, Q4 b) {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y + a.y * b.w + a.z * b.x - a.x * b.z,
+            a.w * b.z + a.z * b.w + a.x * b.y - a.y * b.x, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
 }
-static bool IsLocalCC(void* cc) {   // same root transform as the local PlayerController; cached per (cc, local)
-    static void *lc = nullptr, *ll = nullptr; static bool res = false;
-    if (cc != lc || g_local != ll) {
-        lc = cc; ll = g_local; res = false;
-        Il2CppObject* a = Inv(mGetTr, cc); Il2CppObject* b = Inv(mGetTr, g_local);
-        if (a && b) { if (mRoot) { a = Inv(mRoot, a); b = Inv(mRoot, b); } res = a && a == b; }
-    }
-    return res;
-}
-static int (*o_ccmove)(void*, V3, MethodInfo*);                         // CharacterController.Move(Vector3) -> CollisionFlags
-static int h_ccmove(void* s, V3 m, MethodInfo* mi) {
-    static float vy = 0; static bool air = false; static int seen = 0;
-    if (C.bhop && g_local && IsLocalCC(s)) {
-        if (seen++ < 3) LOG("bhop: local CharacterController.Move hit, gameJump=%p", (void*)mJump);
-        bool moving = m.x * m.x + m.z * m.z > 1e-8f;
-        bool gnd = mCCGnd && Unbox<bool>(Inv(mCCGnd, s));
-        if (moving) {
-            m.x *= C.bspeed; m.z *= C.bspeed;
-            if (gnd) { if (mJump) Inv(mJump, g_local); else { vy = C.bjump; air = true; } }
-        }
-        if (!mJump && air) {   // fallback: own vertical impulse on top of the game's gravity
-            if (gnd && !moving) air = false;
-            else {
-                float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
-                m.y += vy * dt; vy -= 9.81f * dt; if (vy <= 0) { vy = 0; air = false; }
-            }
-        }
-    }
-    return o_ccmove(s, m, mi);
+static V3 QFwd(Q4 q) { return {2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)}; }
+static void AimTick(void* self) {   // runs on the game thread right after the local PlayerController.Update
+    if (!C.aim || !g_local || self != g_local || !mGetRot || !mSetRot) return;
+    Il2CppObject* cam = oCam >= 0 ? Fld<Il2CppObject*>(g_local, oCam) : nullptr;
+    if (!cam) cam = Inv(mCamMain, nullptr);
+    if (!cam) return;
+    Il2CppObject *ct = Inv(mGetTr, cam), *pt = Inv(mGetTr, g_local); if (!ct || !pt) return;
+    Il2CppObject *cr = Inv(mGetRot, ct), *pr = Inv(mGetRot, pt); float cp[3]; if (!cr || !pr || !Pos(cam, cp)) return;
+    V3 cv = {cp[0], cp[1], cp[2]}, t, fwd = Norm(QFwd(Unbox<Q4>(cr)));
+    if (!PickTarget(cv, fwd, &t)) return;                                  // same fov / hit place as silent aim
+    V3 d = Norm(Sub(t, cv));
+    const float PI = 3.14159265f;
+    float cy = atan2f(fwd.x, fwd.z), cpi = asinf(fminf(fmaxf(fwd.y, -1.f), 1.f));
+    float ty = atan2f(d.x, d.z), tp = asinf(fminf(fmaxf(d.y, -1.f), 1.f));
+    float dy = ty - cy; while (dy > PI) dy -= 2 * PI; while (dy < -PI) dy += 2 * PI;
+    float dp = tp - cpi;
+    float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
+    float f = C.asmooth <= 1.f ? 1.f : 1.f - expf(-dt * 40.f / C.asmooth);  // frame-rate independent
+    float sy = dy * f, h = sy * .5f;
+    Q4 qy = {0, sinf(h), 0, cosf(h)}, npr = QMul(qy, Unbox<Q4>(pr));         // yaw on the body: game's look code keeps it
+    void* a1[1] = {&npr}; Inv(mSetRot, pt, a1);
+    float ny = cy + sy, np = cpi + dp * f, c = cosf(np);
+    Q4 nq = LookRot(V3{c * sinf(ny), sinf(np), c * cosf(ny)});               // camera: exact result incl. pitch
+    void* a2[1] = {&nq}; Inv(mSetRot, ct, a2);
 }
 
 static void* Boot(void*) {
@@ -577,15 +551,8 @@ static void* Boot(void*) {
       if (c) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
       if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
       LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
-    { auto kCC = Cls("UnityEngine", "CharacterController");
-      mCCMove = Meth(kCC, "Move", 1); mCCGnd = Meth(kCC, "get_isGrounded", 0); mRoot = Meth(kTr, "get_root", 0); mDt = Meth(Cls("UnityEngine", "Time"), "get_deltaTime", 0);
-      il2cpp_class_get_methods = (decltype(il2cpp_class_get_methods))dlsym(h, "il2cpp_class_get_methods");
-      il2cpp_method_get_name = (decltype(il2cpp_method_get_name))dlsym(h, "il2cpp_method_get_name");
-      il2cpp_method_get_param_count = (decltype(il2cpp_method_get_param_count))dlsym(h, "il2cpp_method_get_param_count");
-      il2cpp_class_get_parent = (decltype(il2cpp_class_get_parent))dlsym(h, "il2cpp_class_get_parent");
-      mJump = Meth(kPC, "Jump", 0); if (!mJump) mJump = FindJump(kPC);
-      if (mCCMove) A64HookFunction(mCCMove->methodPointer, (void*)h_ccmove, (void**)&o_ccmove);
-      LOG("move hooks: ccMove=%p grounded=%p root=%p dt=%p jump=%p", (void*)mCCMove, (void*)mCCGnd, (void*)mRoot, (void*)mDt, (void*)mJump); }
+    mGetRot = Meth(kTr, "get_rotation", 0); mSetRot = Meth(kTr, "set_rotation", 1); mDt = Meth(Cls("UnityEngine", "Time"), "get_deltaTime", 0);
+    LOG("aim: getRot=%p setRot=%p dt=%p cam=%d", (void*)mGetRot, (void*)mSetRot, (void*)mDt, oCam);
     { auto kArms = Cls("", "ArmsController"); auto fr = Meth(kArms, "FireRay", 4); auto fp = Meth(kArms, "FirePellets", 5);
       if (fr) A64HookFunction(fr->methodPointer, (void*)h_fr, (void**)&o_fr);
       if (fp) A64HookFunction(fp->methodPointer, (void*)h_fp, (void**)&o_fp);
