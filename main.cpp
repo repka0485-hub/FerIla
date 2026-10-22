@@ -86,9 +86,10 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
-    float maxd = 200, thick = 2;
+    float maxd = 200, thick = 2, afov = 10;
+    int abone = 0;
 } C;
 static bool g_menu = true;
 static std::string g_cfgMsg = "not saved yet";
@@ -98,10 +99,10 @@ static std::vector<std::string> CfgPaths() {
     return {"/data/data/" + pkg + "/files/esp.json", "/storage/emulated/0/Android/data/" + pkg + "/files/esp.json", "/data/data/" + pkg + "/esp.json"};
 }
 static void Save() {
-    char buf[700];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"maxd\":%g,\"thick\":%g,"
+    char buf[900];
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -115,7 +116,7 @@ static void Load() {
         char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
-        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.saim = g("saim", 0) != 0; C.adraw = g("adraw", 1) != 0; C.abone = (int)g("abone", 0); C.afov = g("afov", 10); C.maxd = g("maxd", 200); C.thick = g("thick", 2);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -127,11 +128,12 @@ struct Ent { ImVec2 head, feet; int hp; float dist; bool enemy; char name[40]; s
 static std::mutex g_mx;
 static std::vector<Ent> g_ents;
 static float g_sw = 0, g_sh = 0;
+static void* g_local = nullptr; static int g_myTeam = 0; static float g_vfov = 60.f;
 static struct { bool down = false; float x = 0, y = 0; } g_touch; // y raw, bottom-up
 
 // ---------- game side ----------
 static Il2CppClass *kPC, *kComp, *kCam, *kTr, *kObj, *kInput, *kPhView, *kPlayer;
-static MethodInfo *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
+static MethodInfo *mCamFov, *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
                   *mNick, *mProps, *mItem;
 static int oView, oPlayer, oDead, oCam, oAnim = -1, oSkel = -1, oSkelCt = -1, oSkelTr = -1, oRag = -1, oBone[7] = {-1, -1, -1, -1, -1, -1, -1};
 static MethodInfo* mGetParent;
@@ -223,7 +225,8 @@ static void Collect() {
         Il2CppObject* cam = (local && oCam >= 0) ? Fld<Il2CppObject*>(local, oCam) : nullptr;
         if (!cam) cam = Inv(mCamMain, nullptr);
         if (cam && !haveLp) haveLp = Pos(cam, lp);           // no local player found: measure from the camera
-        dbgLocal = local; dbgCam = cam; dbgTeam = myTeam;
+        dbgLocal = local; dbgCam = cam; dbgTeam = myTeam; g_local = local; g_myTeam = myTeam;
+        if (cam && mCamFov) g_vfov = Unbox<float>(Inv(mCamFov, cam), 60.f);
         if (cam && haveLp) for (uintptr_t i = 0; i < g_arr->len; i++) {
             void* pc = g_arr->items[i]; if (!pc || pc == local) continue;
             if (Fld<bool>(pc, oDead)) continue;
@@ -294,6 +297,15 @@ static void Menu() {
             ImGui::ColorEdit4("enemy", C.ecol, ImGuiColorEditFlags_NoInputs);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("AIM")) {
+            ImGui::Checkbox("silent aim", &C.saim); ImGui::Checkbox("draw fov", &C.adraw);
+            ImGui::SliderFloat("fov", &C.afov, 1, 90, "%.0f deg");
+            ImGui::TextUnformatted("hit place:");
+            ImGui::RadioButton("head", &C.abone, 0); ImGui::SameLine(); ImGui::RadioButton("chest", &C.abone, 1);
+            ImGui::RadioButton("pelvis", &C.abone, 2); ImGui::SameLine(); ImGui::RadioButton("legs", &C.abone, 3);
+            ImGui::RadioButton("closest to crosshair", &C.abone, 4);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("MEMORY")) {
             ImGui::Checkbox("anti recoil", &C.noRecoil); ImGui::Checkbox("anti scatter", &C.noSpread);
             ImGui::TextWrapped("recoil: camera kick and spray pattern. scatter: random bullet spread.");
@@ -345,6 +357,10 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
       io.AddMousePosEvent(g_touch.x * sx, h - g_touch.y * sy); io.AddMouseButtonEvent(0, g_touch.down); }
     ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
     if (C.esp) Draw(w, h, sx, sy);
+    if (C.saim && C.adraw) {   // fov circle: angular radius -> pixels through the camera fov
+        float r = tanf(C.afov * 0.0174533f) / tanf(g_vfov * 0.5f * 0.0174533f) * (h * 0.5f); if (r > h) r = (float)h;
+        ImGui::GetBackgroundDrawList()->AddCircle(ImVec2(w * .5f, h * .5f), r, IM_COL32(255, 255, 255, 170), 64, 2.f);
+    }
     Bubble((float)w, (float)h);
     if (g_menu) Menu();
     ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -352,6 +368,69 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
 }
 
 // ---------- bootstrap ----------
+// ---------- AIM: silent aim = redirect the shot direction, the camera never moves ----------
+struct V3 { float x, y, z; }; struct Q4 { float x, y, z, w; };
+static V3 Sub(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+static V3 Norm(V3 a) { float l = sqrtf(Dot(a, a)); return l > 1e-6f ? V3{a.x / l, a.y / l, a.z / l} : V3{0, 0, 1}; }
+static Q4 LookRot(V3 f) { // unity LookRotation(f, up)
+    V3 r = Cross(V3{0, 1, 0}, f); if (Dot(r, r) < 1e-6f) r = V3{1, 0, 0}; r = Norm(r); V3 u = Cross(f, r);
+    float m00 = r.x, m01 = u.x, m02 = f.x, m10 = r.y, m11 = u.y, m12 = f.y, m20 = r.z, m21 = u.z, m22 = f.z, tr = m00 + m11 + m22; Q4 q;
+    if (tr > 0) { float s = sqrtf(tr + 1) * 2; q = {(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, .25f * s}; }
+    else if (m00 > m11 && m00 > m22) { float s = sqrtf(1 + m00 - m11 - m22) * 2; q = {.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s}; }
+    else if (m11 > m22) { float s = sqrtf(1 + m11 - m00 - m22) * 2; q = {(m01 + m10) / s, .25f * s, (m12 + m21) / s, (m02 - m20) / s}; }
+    else { float s = sqrtf(1 + m22 - m00 - m11) * 2; q = {(m02 + m20) / s, (m12 + m21) / s, .25f * s, (m10 - m01) / s}; }
+    return q;
+}
+static void* SkelOfPc(void* pc) {
+    if (oAnim < 0 || oSkel < 0) return nullptr;
+    void* anim = Fld<void*>(pc, oAnim); if (!anim) return nullptr;
+    void* sk = Fld<void*>(anim, oSkel);
+    if (!sk && oSkelCt >= 0) sk = Fld<void*>(anim, oSkelCt);
+    if (!sk && oSkelTr >= 0) sk = Fld<void*>(anim, oSkelTr);
+    return sk;
+}
+static bool BoneAt(void* pc, int k, V3* o) { // k = index into oBone: 0 head 1 chest 2 pelvis 5/6 thighs
+    float p[3]; void* sk = SkelOfPc(pc);
+    if (sk && oBone[k] >= 0) { void* rb = Fld<void*>(sk, oBone[k]); if (rb && Pos(rb, p)) { *o = {p[0], p[1], p[2]}; return true; } }
+    if (!Pos(pc, p)) return false;                                   // fallback: feet + fixed height
+    static const float hgt[7] = {1.7f, 1.3f, 0.95f, 1.3f, 1.3f, 0.5f, 0.5f};
+    *o = {p[0], p[1] + hgt[k], p[2]}; return true;
+}
+static bool PickTarget(V3 cam, V3 fwd, V3* out) {
+    if (!g_arr || !g_local) return false;
+    fwd = Norm(fwd); float best = C.afov; bool ok = false;
+    for (uintptr_t i = 0; i < g_arr->len; i++) {
+        void* pc = g_arr->items[i]; if (!pc || pc == g_local || Fld<bool>(pc, oDead)) continue;
+        if (C.team && g_myTeam && TeamOf(Fld<Il2CppObject*>(pc, oPlayer)) == g_myTeam) continue;   // never aim at teammates
+        V3 cand[3]; int n = 0, a = C.abone;
+        if (a == 0 || a == 4) { if (BoneAt(pc, 0, &cand[n])) n++; }
+        if (a == 1 || a == 4) { if (BoneAt(pc, 1, &cand[n])) n++; }
+        if (a == 2 || a == 4) { if (BoneAt(pc, 2, &cand[n])) n++; }
+        if (a == 3) { V3 l, r; if (BoneAt(pc, 5, &l)) { cand[n] = l; if (BoneAt(pc, 6, &r)) cand[n] = {(l.x + r.x) / 2, (l.y + r.y) / 2, (l.z + r.z) / 2}; n++; } }
+        for (int j = 0; j < n; j++) {
+            V3 d = Sub(cand[j], cam); if (sqrtf(Dot(d, d)) > C.maxd) continue;
+            float c = fminf(fmaxf(Dot(Norm(d), fwd), -1.f), 1.f), ang = acosf(c) * 57.29578f;
+            if (ang < best) { best = ang; *out = cand[j]; ok = true; }
+        }
+    }
+    return ok;
+}
+static void (*o_fr)(void*, V3, V3, float, bool, MethodInfo*);            // ArmsController.FireRay(camPos, forward, distance, isKnife)
+static void h_fr(void* s, V3 cam, V3 fwd, float dist, bool knife, MethodInfo* mi) {
+    V3 t; if (C.saim && !knife && PickTarget(cam, fwd, &t)) fwd = Norm(Sub(t, cam));
+    o_fr(s, cam, fwd, dist, knife, mi);
+}
+static void (*o_fp)(void*, void*, V3, Q4, float, int, MethodInfo*);     // ArmsController.FirePellets(params, origin, aim, distance, pellets)
+static void h_fp(void* s, void* prm, V3 org, Q4 aim, float dist, int n, MethodInfo* mi) {
+    if (C.saim) {
+        V3 f = {2 * (aim.x * aim.z + aim.w * aim.y), 2 * (aim.y * aim.z - aim.w * aim.x), 1 - 2 * (aim.x * aim.x + aim.y * aim.y)}, t;
+        if (PickTarget(org, f, &t)) aim = LookRot(Norm(Sub(t, org)));
+    }
+    o_fp(s, prm, org, aim, dist, n, mi);
+}
+
 // ---------- MEMORY: anti recoil / anti scatter (hooks on ArmsController / RecoilControl, output zeroed in RecoilData) ----------
 static int oXd = -1, oYd = -1, oAng = -1, oRel = -1;
 static void ZeroRD(void* r) {
@@ -385,7 +464,7 @@ static void* Boot(void*) {
     kTr = Cls("UnityEngine", "Transform"); kObj = Cls("UnityEngine", "Object"); kInput = Cls("UnityEngine", "Input");
     kPhView = Cls("Photon.Pun", "PhotonView"); kPlayer = Cls("Photon.Realtime", "Player");
     mFind = Meth(kObj, "FindObjectsOfType", 2); mGetTr = Meth(kComp, "get_transform", 0); mGetPos = Meth(kTr, "get_position", 0); mGetParent = Meth(kTr, "get_parent", 0);
-    mCamMain = Meth(kCam, "get_main", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
+    mCamMain = Meth(kCam, "get_main", 0); mCamFov = Meth(kCam, "get_fieldOfView", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
     { auto kScr = Cls("UnityEngine", "Screen"); mScrW = Meth(kScr, "get_width", 0); mScrH = Meth(kScr, "get_height", 0); }
     mTouchCnt = Meth(kInput, "get_touchCount", 0); mGetTouch = Meth(kInput, "GetTouch", 1);
     mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
@@ -414,6 +493,10 @@ static void* Boot(void*) {
       if (c) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
       if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
       LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
+    { auto kArms = Cls("", "ArmsController"); auto fr = Meth(kArms, "FireRay", 4); auto fp = Meth(kArms, "FirePellets", 5);
+      if (fr) A64HookFunction(fr->methodPointer, (void*)h_fr, (void**)&o_fr);
+      if (fp) A64HookFunction(fp->methodPointer, (void*)h_fp, (void**)&o_fp);
+      LOG("aim hooks: fireRay=%p firePellets=%p", (void*)fr, (void*)fp); }
     return nullptr;
 }
 static void Start() { static bool once; if (once) return; once = true; pthread_t t; pthread_create(&t, nullptr, Boot, nullptr); }
