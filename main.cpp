@@ -86,7 +86,7 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
     float maxd = 200, thick = 2;
 } C;
@@ -99,9 +99,9 @@ static std::vector<std::string> CfgPaths() {
 }
 static void Save() {
     char buf[700];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"maxd\":%g,\"thick\":%g,"
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"maxd\":%g,\"thick\":%g,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -115,7 +115,7 @@ static void Load() {
         char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
-        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -294,6 +294,11 @@ static void Menu() {
             ImGui::ColorEdit4("enemy", C.ecol, ImGuiColorEditFlags_NoInputs);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("MEMORY")) {
+            ImGui::Checkbox("anti recoil", &C.noRecoil); ImGui::Checkbox("anti scatter", &C.noSpread);
+            ImGui::TextWrapped("recoil: camera kick and spray pattern. scatter: random bullet spread.");
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("CONFIG")) {
             if (ImGui::Button("SAVE")) Save(); ImGui::SameLine(); if (ImGui::Button("LOAD")) Load(); ImGui::SameLine();
             if (ImGui::Button("RESET")) { C = Cfg(); g_cfgMsg = "defaults restored"; }
@@ -347,6 +352,25 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
 }
 
 // ---------- bootstrap ----------
+// ---------- MEMORY: anti recoil / anti scatter (hooks on ArmsController / RecoilControl, output zeroed in RecoilData) ----------
+static int oXd = -1, oYd = -1, oAng = -1, oRel = -1;
+static void ZeroRD(void* r) {
+    if (!r) return; char* c = (char*)r;
+    if (C.noRecoil) { if (oXd >= 0) *(float*)(c + oXd) = 0; if (oYd >= 0) *(float*)(c + oYd) = 0; }
+    if (C.noSpread) { if (oAng >= 0) *(float*)(c + oAng) = 0; if (oRel >= 0) { *(float*)(c + oRel) = 0; *(float*)(c + oRel + 4) = 0; } }
+}
+static void (*o_acr)(void*, float, MethodInfo*);                        // ApplyCameraRecoil(float coeff)
+static void h_acr(void* s, float c, MethodInfo* mi) { o_acr(s, C.noRecoil ? 0.f : c, mi); }
+static void (*o_grd)(void*, void**, float, float, int, MethodInfo*);   // GetRelativeDispertion(ref RecoilData, add, angle, edgeShots)
+static void h_grd(void* s, void** rd, float add, float ang, int edge, MethodInfo* mi) {
+    if (C.noSpread) { add = 0; ang = 0; }
+    o_grd(s, rd, add, ang, edge, mi); if (rd) ZeroRD(*rd);
+}
+static void* (*o_gns)(void*, bool, float, MethodInfo*);                 // RecoilControl.GetNextShot(bool, float)
+static void* h_gns(void* s, bool cont, float t, MethodInfo* mi) { void* r = o_gns(s, cont, t, mi); ZeroRD(r); return r; }
+static void* (*o_gcd)(void*, float, MethodInfo*);                       // RecoilControl.GetCurrentDeviation(float)
+static void* h_gcd(void* s, float t, MethodInfo* mi) { void* r = o_gcd(s, t, mi); ZeroRD(r); return r; }
+
 static void* Boot(void*) {
     LOG("boot");
     void* egl = dlsym(dlopen("libEGL.so", RTLD_NOW), "eglSwapBuffers");
@@ -381,6 +405,15 @@ static void* Boot(void*) {
     if (mEs) { A64HookFunction(mEs->methodPointer, (void*)hook_es, (void**)&orig_es); LOG("EventSystem.Update hooked"); }
     mUpdate = Meth(kPC, "Update", 0);
     if (mUpdate) { A64HookFunction(mUpdate->methodPointer, (void*)hook_update, (void**)&orig_update); LOG("PlayerController.Update hooked"); }
+    { auto kRD = Cls("", "RecoilData"); oXd = Off(kRD, "XDeviation"); oYd = Off(kRD, "YDeviation"); oAng = Off(kRD, "AngleDispertion"); oRel = Off(kRD, "RelativeDispersion");
+      auto kArms = Cls("", "ArmsController"); auto kRC = Cls("", "RecoilControl");
+      auto a = Meth(kArms, "ApplyCameraRecoil", 1); auto b = Meth(kArms, "GetRelativeDispertion", 4);
+      auto c = Meth(kRC, "GetNextShot", 2); auto d = Meth(kRC, "GetCurrentDeviation", 1);
+      if (a) A64HookFunction(a->methodPointer, (void*)h_acr, (void**)&o_acr);
+      if (b) A64HookFunction(b->methodPointer, (void*)h_grd, (void**)&o_grd);
+      if (c) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
+      if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
+      LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
     return nullptr;
 }
 static void Start() { static bool once; if (once) return; once = true; pthread_t t; pthread_create(&t, nullptr, Boot, nullptr); }
