@@ -466,8 +466,10 @@ static void h_fp(void* s, void* prm, V3 org, Q4 aim, float dist, int n, MethodIn
 #define NOREC (C.noRecoil || C.aim)   // aim on = bullets go exactly where the crosshair is
 #define NOSPR (C.noSpread || C.aim)
 static int oXd = -1, oYd = -1, oAng = -1, oRel = -1;
+static bool g_rdVal = false, g_rdRef = false;   // RecoilData: struct (ref param = data itself, returned via x8) vs class
+static bool (*il2cpp_class_is_valuetype)(Il2CppClass*);
 static void ZeroRD(void* r) {
-    if (!r) return; char* c = (char*)r;
+    if (!r) return; char* c = (char*)r - (g_rdVal ? 0x10 : 0);   // il2cpp field offsets include the 0x10 object header even for structs
     if (NOREC) { if (oXd >= 0) *(float*)(c + oXd) = 0; if (oYd >= 0) *(float*)(c + oYd) = 0; }
     if (NOSPR) { if (oAng >= 0) *(float*)(c + oAng) = 0; if (oRel >= 0) { *(float*)(c + oRel) = 0; *(float*)(c + oRel + 4) = 0; } }
 }
@@ -476,7 +478,7 @@ static void h_acr(void* s, float c, MethodInfo* mi) { o_acr(s, NOREC ? 0.f : c, 
 static void (*o_grd)(void*, void**, float, float, int, MethodInfo*);   // GetRelativeDispertion(ref RecoilData, add, angle, edgeShots)
 static void h_grd(void* s, void** rd, float add, float ang, int edge, MethodInfo* mi) {
     if (NOSPR) { add = 0; ang = 0; }
-    o_grd(s, rd, add, ang, edge, mi); if (rd) ZeroRD(*rd);
+    o_grd(s, rd, add, ang, edge, mi); if (rd) ZeroRD(g_rdVal ? (void*)rd : *rd);
 }
 static void* (*o_gns)(void*, bool, float, MethodInfo*);                 // RecoilControl.GetNextShot(bool, float)
 static void* h_gns(void* s, bool cont, float t, MethodInfo* mi) { void* r = o_gns(s, cont, t, mi); ZeroRD(r); return r; }
@@ -592,10 +594,13 @@ static void* Boot(void*) {
       auto kArms = Cls("", "ArmsController"); auto kRC = Cls("", "RecoilControl");
       auto a = Meth(kArms, "ApplyCameraRecoil", 1); auto b = Meth(kArms, "GetRelativeDispertion", 4);
       auto c = Meth(kRC, "GetNextShot", 2); auto d = Meth(kRC, "GetCurrentDeviation", 1);
+      il2cpp_class_is_valuetype = (decltype(il2cpp_class_is_valuetype))dlsym(h, "il2cpp_class_is_valuetype");
+      if (il2cpp_class_is_valuetype && kRD) { g_rdVal = il2cpp_class_is_valuetype(kRD); g_rdRef = !g_rdVal; }
+      LOG("RecoilData valuetype=%d (struct-return hooks %s)", g_rdVal, g_rdRef ? "on" : "OFF");
       if (a) A64HookFunction(a->methodPointer, (void*)h_acr, (void**)&o_acr);
       if (b) A64HookFunction(b->methodPointer, (void*)h_grd, (void**)&o_grd);
-      if (c) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
-      if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
+      if (c && g_rdRef) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
+      if (d && g_rdRef) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
       LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
     mGetRot = Meth(kTr, "get_rotation", 0); mSetRot = Meth(kTr, "set_rotation", 1); mDt = Meth(Cls("UnityEngine", "Time"), "get_deltaTime", 0);
 #define RS(n) n = (decltype(n))dlsym(h, #n);
