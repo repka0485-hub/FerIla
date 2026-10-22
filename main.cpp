@@ -47,6 +47,8 @@ API(const char*, il2cpp_class_get_name, (Il2CppClass*));
 API(Il2CppString*, il2cpp_string_new, (const char*));
 API(uint32_t, il2cpp_gchandle_new, (Il2CppObject*, bool));
 API(void, il2cpp_gchandle_free, (uint32_t));
+API(void*, il2cpp_class_get_fields, (Il2CppClass*, void**));   // optional, diagnostics only
+API(const char*, il2cpp_field_get_name, (FieldInfo*));
 
 static Il2CppDomain* g_dom;
 
@@ -56,6 +58,8 @@ static bool ResolveApi(void* h) {
     R(il2cpp_class_from_name) R(il2cpp_class_get_method_from_name) R(il2cpp_class_get_field_from_name)
     R(il2cpp_field_get_offset) R(il2cpp_thread_attach) R(il2cpp_class_get_type) R(il2cpp_type_get_object)
     R(il2cpp_runtime_invoke) R(il2cpp_object_get_class) R(il2cpp_class_get_name) R(il2cpp_string_new) R(il2cpp_gchandle_new) R(il2cpp_gchandle_free)
+    il2cpp_class_get_fields = (decltype(il2cpp_class_get_fields))dlsym(h, "il2cpp_class_get_fields");
+    il2cpp_field_get_name = (decltype(il2cpp_field_get_name))dlsym(h, "il2cpp_field_get_name");
 #undef R
     return true;
 }
@@ -91,6 +95,7 @@ struct Cfg {
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
     float maxd = 200, thick = 2, aimFov = 200, aimSmooth = 6;
     int aimBone = 0; // 0 head, 1 chest, 2 pelvis
+    int aimMode = 1; // 0 camera only, 1 body yaw + camera
 } C;
 static bool g_menu = true;
 static std::string g_cfgMsg = "not saved yet";
@@ -102,9 +107,9 @@ static std::vector<std::string> CfgPaths() {
 static void Save() {
     char buf[900];
     snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"maxd\":%g,\"thick\":%g,"
-             "\"aim\":%d,\"atouch\":%d,\"showfov\":%d,\"afov\":%g,\"asm\":%g,\"abone\":%d,"
+             "\"aim\":%d,\"atouch\":%d,\"showfov\":%d,\"afov\":%g,\"asm\":%g,\"abone\":%d,\"amode\":%d,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.maxd, C.thick, C.aim, C.aimTouch, C.aimFovShow, C.aimFov, C.aimSmooth, C.aimBone, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.maxd, C.thick, C.aim, C.aimTouch, C.aimFovShow, C.aimFov, C.aimSmooth, C.aimBone, C.aimMode, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -119,7 +124,7 @@ static void Load() {
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
         C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
-        C.aim = g("aim", 0) != 0; C.aimTouch = g("atouch", 1) != 0; C.aimFovShow = g("showfov", 1) != 0; C.aimFov = g("afov", 200); C.aimSmooth = g("asm", 6); C.aimBone = (int)g("abone", 0);
+        C.aim = g("aim", 0) != 0; C.aimTouch = g("atouch", 1) != 0; C.aimFovShow = g("showfov", 1) != 0; C.aimFov = g("afov", 200); C.aimSmooth = g("asm", 6); C.aimBone = (int)g("abone", 0); C.aimMode = (int)g("amode", 1);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -244,19 +249,29 @@ static bool AimPt(void* pc, float* o) { // world pos of the selected bone, fallb
     o[1] += C.aimBone == 0 ? 1.6f : C.aimBone == 1 ? 1.2f : 0.9f; return true;
 }
 static float Wrap(float a) { a = fmodf(a, 360.f); if (a > 180.f) a -= 360.f; if (a < -180.f) a += 360.f; return a; }
-// camera euler (x=pitch, y=yaw, unity: +x looks down). smooth = divisor per call, 1 = snap
+static struct { int calls = 0, runs = 0; bool has = false, down = false; float cur[3] = {}, want[2] = {}, back[3] = {}; } g_dbg; // shown in the AIM tab
+// unity euler: x = pitch (+ looks down), y = yaw. smooth = divisor per call, 1 = snap
 static void Aim() {
+    g_dbg.calls++; g_dbg.has = g_aimHas; g_dbg.down = g_down;
     if (!C.aim || g_menu || !g_aimHas || !g_aimCam || !mGetEul || !mSetEul) return;
     if (C.aimTouch && !g_down) return;
     float cp[3]; if (!Pos(g_aimCam, cp)) return;
-    auto ctr = Inv(mGetTr, g_aimCam); if (!ctr) return;
-    auto ev = Inv(mGetEul, ctr); if (!ev) return;
-    float cur[3]; memcpy(cur, (char*)ev + 0x10, 12);
     float dx = g_aimPos[0] - cp[0], dy = g_aimPos[1] - cp[1], dz = g_aimPos[2] - cp[2];
     float yaw = atan2f(dx, dz) * 57.29578f, pitch = -atan2f(dy, hypotf(dx, dz)) * 57.29578f;
     float s = fmaxf(C.aimSmooth, 1.f);
+    if (C.aimMode == 1 && g_localPC) {   // body carries yaw in most fps/tps controllers
+        if (auto btr = Inv(mGetTr, g_localPC)) if (auto bv = Inv(mGetEul, btr)) {
+            float b[3]; memcpy(b, (char*)bv + 0x10, 12);
+            float nb[3] = {b[0], b[1] + Wrap(yaw - b[1]) / s, b[2]}; void* ba[1] = {nb}; Inv(mSetEul, btr, ba);
+        }
+    }
+    auto ctr = Inv(mGetTr, g_aimCam); if (!ctr) return;
+    auto ev = Inv(mGetEul, ctr); if (!ev) return;
+    float cur[3]; memcpy(cur, (char*)ev + 0x10, 12);
     float n[3] = {cur[0] + Wrap(pitch - cur[0]) / s, cur[1] + Wrap(yaw - cur[1]) / s, cur[2]};
     void* a[1] = {n}; Inv(mSetEul, ctr, a);
+    g_dbg.runs++; memcpy(g_dbg.cur, cur, 12); g_dbg.want[0] = pitch; g_dbg.want[1] = yaw;
+    if (auto rv = Inv(mGetEul, ctr)) memcpy(g_dbg.back, (char*)rv + 0x10, 12);   // read back: if != n, something overwrote it instantly
 }
 static void Collect() {
     static int logn = 0; void* dbgLocal = nullptr; void* dbgCam = nullptr; int hidden = 0, dbgTeam = 0;
@@ -362,7 +377,10 @@ static void Menu() {
         if (ImGui::BeginTabItem("AIM")) {
             ImGui::Checkbox("enable", &C.aim); ImGui::Checkbox("only while touching", &C.aimTouch); ImGui::Checkbox("show fov", &C.aimFovShow);
             ImGui::SliderFloat("fov (px)", &C.aimFov, 30, 800); ImGui::SliderFloat("smooth", &C.aimSmooth, 1, 20);
-            ImGui::Combo("bone", &C.aimBone, "head\0chest\0pelvis\0");
+            ImGui::Combo("bone", &C.aimBone, "head\0chest\0pelvis\0"); ImGui::Combo("mode", &C.aimMode, "camera\0body yaw + camera\0");
+            ImGui::Separator();
+            ImGui::Text("hook calls %d | applied %d", g_dbg.calls, g_dbg.runs); ImGui::Text("target %d | touch %d", (int)g_dbg.has, (int)g_dbg.down);
+            ImGui::Text("cur   p%.0f y%.0f", g_dbg.cur[0], g_dbg.cur[1]); ImGui::Text("want  p%.0f y%.0f", g_dbg.want[0], g_dbg.want[1]); ImGui::Text("after p%.0f y%.0f", g_dbg.back[0], g_dbg.back[1]);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("MEMORY")) {
@@ -463,6 +481,7 @@ static void* Boot(void*) {
     mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
     mNick = Meth(kPlayer, "get_NickName", 0); mProps = Meth(kPlayer, "get_CustomProperties", 0);
     oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath"); oCam = Off(kPC, "_mainCamera");
+    if (kPC && il2cpp_class_get_fields && il2cpp_field_get_name) { void* it = nullptr; while (auto f = (FieldInfo*)il2cpp_class_get_fields(kPC, &it)) LOG("PC field %s +0x%zx", il2cpp_field_get_name(f), il2cpp_field_get_offset(f)); }
     { auto kPAC = Cls("ScarletWork.Photon.TPS", "PlayerAnimatorController"); auto kSk = Cls("ScarletWork.Game", "PlayerSkeleton");   // namespaces from the dump
       oAnim = Off(kPC, "_animatorController"); oSkel = Off(kPAC, "_skeleton"); oSkelCt = Off(kPAC, "_ctSkeleton"); oSkelTr = Off(kPAC, "_trSkeleton");
       oRag = Off(kSk, "ragdollRigidbodies"); oBody = Off(kSk, "_body"); oBodyLod = Off(kSk, "_bodyLod");
