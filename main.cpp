@@ -460,17 +460,19 @@ static void h_fp(void* s, void* prm, V3 org, Q4 aim, float dist, int n, MethodIn
 }
 
 // ---------- MEMORY: anti recoil / anti scatter (hooks on ArmsController / RecoilControl, output zeroed in RecoilData) ----------
+#define NOREC (C.noRecoil || C.aim)   // aim on = bullets go exactly where the crosshair is
+#define NOSPR (C.noSpread || C.aim)
 static int oXd = -1, oYd = -1, oAng = -1, oRel = -1;
 static void ZeroRD(void* r) {
     if (!r) return; char* c = (char*)r;
-    if (C.noRecoil) { if (oXd >= 0) *(float*)(c + oXd) = 0; if (oYd >= 0) *(float*)(c + oYd) = 0; }
-    if (C.noSpread) { if (oAng >= 0) *(float*)(c + oAng) = 0; if (oRel >= 0) { *(float*)(c + oRel) = 0; *(float*)(c + oRel + 4) = 0; } }
+    if (NOREC) { if (oXd >= 0) *(float*)(c + oXd) = 0; if (oYd >= 0) *(float*)(c + oYd) = 0; }
+    if (NOSPR) { if (oAng >= 0) *(float*)(c + oAng) = 0; if (oRel >= 0) { *(float*)(c + oRel) = 0; *(float*)(c + oRel + 4) = 0; } }
 }
 static void (*o_acr)(void*, float, MethodInfo*);                        // ApplyCameraRecoil(float coeff)
-static void h_acr(void* s, float c, MethodInfo* mi) { o_acr(s, C.noRecoil ? 0.f : c, mi); }
+static void h_acr(void* s, float c, MethodInfo* mi) { o_acr(s, NOREC ? 0.f : c, mi); }
 static void (*o_grd)(void*, void**, float, float, int, MethodInfo*);   // GetRelativeDispertion(ref RecoilData, add, angle, edgeShots)
 static void h_grd(void* s, void** rd, float add, float ang, int edge, MethodInfo* mi) {
-    if (C.noSpread) { add = 0; ang = 0; }
+    if (NOSPR) { add = 0; ang = 0; }
     o_grd(s, rd, add, ang, edge, mi); if (rd) ZeroRD(*rd);
 }
 static void* (*o_gns)(void*, bool, float, MethodInfo*);                 // RecoilControl.GetNextShot(bool, float)
@@ -485,9 +487,19 @@ static Q4 QMul(Q4 a, Q4 b) {
             a.w * b.z + a.z * b.w + a.x * b.y - a.y * b.x, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
 }
 static V3 QFwd(Q4 q) { return {2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)}; }
+static bool g_pLock = false;   // true while aim holds a target: view is frozen, gyro input is zeroed
+// gyro: the game applies it in its own code after our write, so zero it at the source while locked
+static V3 (*o_grr)(void*, MethodInfo*); static V3 h_grr(void* s, MethodInfo* mi) { V3 r = o_grr(s, mi); static int n = 0; if (g_pLock && n++ < 3) LOG("gyro rotationRate zeroed"); return g_pLock ? V3{0, 0, 0} : r; }
+static V3 (*o_gru)(void*, MethodInfo*); static V3 h_gru(void* s, MethodInfo* mi) { V3 r = o_gru(s, mi); static int n = 0; if (g_pLock && n++ < 3) LOG("gyro rotationRateUnbiased zeroed"); return g_pLock ? V3{0, 0, 0} : r; }
+static Q4 (*o_gat)(void*, MethodInfo*);
+static Q4 h_gat(void* s, MethodInfo* mi) {   // absolute attitude: hold the value from the moment of lock
+    static Q4 held; static bool has = false; Q4 r = o_gat(s, mi);
+    if (g_pLock) { if (!has) { held = r; has = true; static int n = 0; if (n++ < 3) LOG("gyro attitude held"); } return held; }
+    has = false; return r;
+}
 static void AimTick(void* self) {   // runs on the game thread right after the local PlayerController.Update
-    static bool pLock = false; static float pitchLock = 0.f;                // pitch frozen while aim holds a target
-    if (!C.aim || !g_local || self != g_local || !mGetRot || !mSetRot) { pLock = false; return; }
+    static float pitchLock = 0.f;               // pitch frozen while aim holds a target
+    if (!C.aim || !g_local || self != g_local || !mGetRot || !mSetRot) { g_pLock = false; return; }
     Il2CppObject* cam = oCam >= 0 ? Fld<Il2CppObject*>(g_local, oCam) : nullptr;
     if (!cam) cam = Inv(mCamMain, nullptr);
     if (!cam) return;
@@ -495,11 +507,11 @@ static void AimTick(void* self) {   // runs on the game thread right after the l
     Il2CppObject *cr = Inv(mGetRot, ct), *pr = Inv(mGetRot, pt); float cp[3]; if (!cr || !pr || !Pos(cam, cp)) return;
     Q4 camQ = Unbox<Q4>(cr), bodyQ = Unbox<Q4>(pr);                         // snapshot before any write
     V3 cv = {cp[0], cp[1], cp[2]}, t, fwd = Norm(QFwd(camQ));
-    if (!PickTarget(cv, fwd, &t)) { pLock = false; return; }                // same fov / hit place as silent aim
+    if (!PickTarget(cv, fwd, &t)) { g_pLock = false; return; }                // same fov / hit place as silent aim
     V3 d = Norm(Sub(t, cv));
     const float PI = 3.14159265f;
     float cy = atan2f(fwd.x, fwd.z), cpi = asinf(fminf(fmaxf(fwd.y, -1.f), 1.f));
-    if (!pLock) { pLock = true; pitchLock = cpi; }                          // pitch at the moment of lock = where He put it
+    if (!g_pLock) { g_pLock = true; pitchLock = cpi; }                          // pitch at the moment of lock = where He put it
     float dy = atan2f(d.x, d.z) - cy;                                       // yaw only
     while (dy > PI) dy -= 2 * PI; while (dy < -PI) dy += 2 * PI;
     float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
@@ -590,6 +602,12 @@ static void* Boot(void*) {
       if (fr) A64HookFunction(fr->methodPointer, (void*)h_fr, (void**)&o_fr);
       if (fp) A64HookFunction(fp->methodPointer, (void*)h_fp, (void**)&o_fp);
       LOG("aim hooks: fireRay=%p firePellets=%p", (void*)fr, (void*)fp); }
+    { auto kG = Cls("UnityEngine", "Gyroscope");
+      auto a = Meth(kG, "get_rotationRate", 0), b = Meth(kG, "get_rotationRateUnbiased", 0), c = Meth(kG, "get_attitude", 0);
+      if (a) A64HookFunction(a->methodPointer, (void*)h_grr, (void**)&o_grr);
+      if (b) A64HookFunction(b->methodPointer, (void*)h_gru, (void**)&o_gru);
+      if (c) A64HookFunction(c->methodPointer, (void*)h_gat, (void**)&o_gat);
+      LOG("gyro hooks: rate=%p unbiased=%p attitude=%p", (void*)a, (void*)b, (void*)c); }
     return nullptr;
 }
 static void Start() { static bool once; if (once) return; once = true; pthread_t t; pthread_create(&t, nullptr, Boot, nullptr); }
