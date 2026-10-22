@@ -87,10 +87,10 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true, aim = false, aonf = false;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, aim = false, aimTouch = true, aimFovShow = true;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
-    float maxd = 200, thick = 2, afov = 10, asp = 5;   // asp = smooth: 1 = almost snap, 30 = very slow
-    int abone = 0;
+    float maxd = 200, thick = 2, aimFov = 200, aimSmooth = 6;
+    int aimBone = 0; // 0 head, 1 chest, 2 pelvis
 } C;
 static bool g_menu = true;
 static std::string g_cfgMsg = "not saved yet";
@@ -101,9 +101,10 @@ static std::vector<std::string> CfgPaths() {
 }
 static void Save() {
     char buf[900];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"asp\":%g,\"aim\":%d,\"aonf\":%d,\"maxd\":%g,\"thick\":%g,"
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"maxd\":%g,\"thick\":%g,"
+             "\"aim\":%d,\"atouch\":%d,\"showfov\":%d,\"afov\":%g,\"asm\":%g,\"abone\":%d,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.asp, C.aim, C.aonf, C.maxd, C.thick, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.maxd, C.thick, C.aim, C.aimTouch, C.aimFovShow, C.aimFov, C.aimSmooth, C.aimBone, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -117,8 +118,8 @@ static void Load() {
         char b[1024] = {}; fread(b, 1, 1023, f); fclose(f); std::string s = b;
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
-        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.saim = g("saim", 0) != 0; C.adraw = g("adraw", 1) != 0; C.abone = (int)g("abone", 0); C.afov = g("afov", 10); C.maxd = g("maxd", 200); C.thick = g("thick", 2); C.asp = g("asp", 5); C.aim = g("aim", 0) != 0; C.aonf = g("aonf", 0) != 0;
-        if (C.asp < 1) C.asp = 1; if (C.asp > 30) C.asp = 30;   // old configs stored speed up to 100
+        C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.maxd = g("maxd", 200); C.thick = g("thick", 2);
+        C.aim = g("aim", 0) != 0; C.aimTouch = g("atouch", 1) != 0; C.aimFovShow = g("showfov", 1) != 0; C.aimFov = g("afov", 200); C.aimSmooth = g("asm", 6); C.aimBone = (int)g("abone", 0);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -130,12 +131,11 @@ struct Ent { ImVec2 head, feet; int hp; float dist; bool enemy; char name[40]; s
 static std::mutex g_mx;
 static std::vector<Ent> g_ents;
 static float g_sw = 0, g_sh = 0;
-static void* g_local = nullptr; static int g_myTeam = 0; static float g_vfov = 60.f;
 static struct { bool down = false; float x = 0, y = 0; } g_touch; // y raw, bottom-up
 
 // ---------- game side ----------
 static Il2CppClass *kPC, *kComp, *kCam, *kTr, *kObj, *kInput, *kPhView, *kPlayer;
-static MethodInfo *mCamFov, *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
+static MethodInfo *mScrW, *mScrH, *mFind, *mGetTr, *mGetPos, *mCamMain, *mW2S, *mTouchCnt, *mGetTouch, *mIsMine, *mHealth,
                   *mNick, *mProps, *mItem;
 static int oView, oPlayer, oDead, oCam, oAnim = -1, oSkel = -1, oSkelCt = -1, oSkelTr = -1, oRag = -1, oBone[7] = {-1, -1, -1, -1, -1, -1, -1};
 static MethodInfo* mGetParent;
@@ -143,6 +143,9 @@ static MethodInfo *mGetBones, *mGetName;
 static int oBody = -1, oBodyLod = -1;
 static Il2CppObject* g_pcType;
 static Il2CppArray* g_arr; static int g_tick;
+// aim state: game thread only (Collect writes, Aim reads)
+static MethodInfo *mGetEul, *mSetEul;
+static bool g_aimHas, g_down; static float g_aimPos[3]; static void* g_aimCam; static void* g_localPC;
 
 static int TeamOf(Il2CppObject* player) { // any value type: equal value == same team
     if (!player) return 0;
@@ -229,6 +232,32 @@ static int HP(Il2CppObject* o) {
     if (!strcmp(n, "Int32")) return Unbox<int>(o); if (!strcmp(n, "Single")) return (int)Unbox<float>(o); return 100;
 }
 static uint32_t g_arrH;
+static bool AimPt(void* pc, float* o) { // world pos of the selected bone, fallback = feet + offset
+    if (oAnim >= 0 && oSkel >= 0) {
+        void* anim = Fld<void*>(pc, oAnim); void* sk = anim ? Fld<void*>(anim, oSkel) : nullptr;
+        if (!sk && anim && oSkelCt >= 0) sk = Fld<void*>(anim, oSkelCt);
+        if (!sk && anim && oSkelTr >= 0) sk = Fld<void*>(anim, oSkelTr);
+        int bi = C.aimBone < 0 ? 0 : C.aimBone > 2 ? 2 : C.aimBone;
+        if (sk && oBone[bi] >= 0) { void* b = Fld<void*>(sk, oBone[bi]); if (b && Pos(b, o)) return true; }
+    }
+    if (!Pos(pc, o)) return false;
+    o[1] += C.aimBone == 0 ? 1.6f : C.aimBone == 1 ? 1.2f : 0.9f; return true;
+}
+static float Wrap(float a) { a = fmodf(a, 360.f); if (a > 180.f) a -= 360.f; if (a < -180.f) a += 360.f; return a; }
+// camera euler (x=pitch, y=yaw, unity: +x looks down). smooth = divisor per call, 1 = snap
+static void Aim() {
+    if (!C.aim || g_menu || !g_aimHas || !g_aimCam || !mGetEul || !mSetEul) return;
+    if (C.aimTouch && !g_down) return;
+    float cp[3]; if (!Pos(g_aimCam, cp)) return;
+    auto ctr = Inv(mGetTr, g_aimCam); if (!ctr) return;
+    auto ev = Inv(mGetEul, ctr); if (!ev) return;
+    float cur[3]; memcpy(cur, (char*)ev + 0x10, 12);
+    float dx = g_aimPos[0] - cp[0], dy = g_aimPos[1] - cp[1], dz = g_aimPos[2] - cp[2];
+    float yaw = atan2f(dx, dz) * 57.29578f, pitch = -atan2f(dy, hypotf(dx, dz)) * 57.29578f;
+    float s = fmaxf(C.aimSmooth, 1.f);
+    float n[3] = {cur[0] + Wrap(pitch - cur[0]) / s, cur[1] + Wrap(yaw - cur[1]) / s, cur[2]};
+    void* a[1] = {n}; Inv(mSetEul, ctr, a);
+}
 static void Collect() {
     static int logn = 0; void* dbgLocal = nullptr; void* dbgCam = nullptr; int hidden = 0, dbgTeam = 0;
     if (g_pcType && (!g_arr || (g_tick++ % 30) == 0)) {
@@ -238,6 +267,7 @@ static void Collect() {
         g_arrH = arr ? il2cpp_gchandle_new((Il2CppObject*)arr, false) : 0; g_arr = arr;
     }
     std::vector<Ent> out;
+    bool haveT = false; float tgt[3] = {}, bestD = 1e9f; g_aimHas = false;
     if (g_arr) {
         void* local = nullptr; int myTeam = 0; float lp[3] = {}; bool haveLp = false;
         for (uintptr_t i = 0; i < g_arr->len; i++) {
@@ -248,8 +278,8 @@ static void Collect() {
         Il2CppObject* cam = (local && oCam >= 0) ? Fld<Il2CppObject*>(local, oCam) : nullptr;
         if (!cam) cam = Inv(mCamMain, nullptr);
         if (cam && !haveLp) haveLp = Pos(cam, lp);           // no local player found: measure from the camera
-        dbgLocal = local; dbgCam = cam; dbgTeam = myTeam; g_local = local; g_myTeam = myTeam;
-        if (cam && mCamFov) g_vfov = Unbox<float>(Inv(mCamFov, cam), 60.f);
+        dbgLocal = local; dbgCam = cam; dbgTeam = myTeam;
+        float sw0 = 0, sh0 = 0; if (C.aim) { sw0 = (float)Unbox<int>(Inv(mScrW, nullptr)); sh0 = (float)Unbox<int>(Inv(mScrH, nullptr)); }
         if (cam && haveLp) for (uintptr_t i = 0; i < g_arr->len; i++) {
             void* pc = g_arr->items[i]; if (!pc || pc == local) continue;
             if (Fld<bool>(pc, oDead)) continue;
@@ -262,10 +292,15 @@ static void Collect() {
             auto pl = Fld<Il2CppObject*>(pc, oPlayer);
             int t = TeamOf(pl); e.enemy = true;
             if (C.team && myTeam && t == myTeam) { hidden++; continue; }   // teammate
+            if (C.aim) { float ap[3]; ImVec2 sp; // raw unity screen px, y bottom-up, centre = sw/2, sh/2
+                if (AimPt(pc, ap) && W2S(cam, ap[0], ap[1], ap[2], sp)) {
+                    float d = hypotf(sp.x - sw0 * .5f, sp.y - sh0 * .5f);
+                    if (d < C.aimFov && d < bestD) { bestD = d; memcpy(tgt, ap, 12); haveT = true; } } }
             snprintf(e.name, sizeof e.name, "%s", Str((Il2CppString*)Inv(mNick, pl)).c_str());
             if (C.skel) Skel(pc, cam, e);
             out.push_back(e);
         }
+        g_localPC = local; g_aimCam = cam; g_aimHas = haveT && cam; if (haveT) memcpy(g_aimPos, tgt, 12);
     }
     if ((logn++ % 250) == 0) LOG("collect: players=%lu local=%p cam=%p drawn=%lu myTeam=%d hiddenTeam=%d", g_arr ? (unsigned long)g_arr->len : 0UL, dbgLocal, dbgCam, (unsigned long)out.size(), dbgTeam, hidden);
     // touch (legacy Input, main thread only)
@@ -275,24 +310,24 @@ static void Collect() {
         static int dbg = 0; if (dbg++ < 5) LOG("touch n=%d obj=%p", n, (void*)t);
         if (t) { float* f = (float*)((char*)t + 0x10); tx = f[1]; ty = f[2]; int ph = *(int*)&f[9]; down = ph != 3 && ph != 4; } }
     float sw = (float)Unbox<int>(Inv(mScrW, nullptr)), sh = (float)Unbox<int>(Inv(mScrH, nullptr));
+    g_down = down;
     std::lock_guard<std::mutex> l(g_mx); g_ents.swap(out); g_touch = {down, tx, ty}; g_sw = sw; g_sh = sh;
 }
 static void (*orig_update)(void*, MethodInfo*); static MethodInfo* mUpdate;
-static void (*orig_lu)(void*, MethodInfo*);
 static void (*orig_es)(void*, MethodInfo*); static MethodInfo* mEs;
-static bool g_lateHooked;
+static void (*orig_late)(void*, MethodInfo*); static MethodInfo* mLate;
 static void Tick() { // called from Unity script thread (hooks), ~120Hz max
     static auto last = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now();
     if (now - last > std::chrono::milliseconds(8)) { last = now; Collect(); }
 }
-static void Aim(void* self);
-static void hook_update(void* self, MethodInfo* mi) { Tick(); orig_update(self, mi); if (!g_lateHooked && self == g_local) Aim(self); }
-static void hook_lu(void* self, MethodInfo* mi) { orig_lu(self, mi); if (self == g_local) Aim(self); }   // after the game wrote the camera = no fight with it, no jitter
+static void hook_update(void* self, MethodInfo* mi) { Tick(); orig_update(self, mi); if (!mLate && self == g_localPC) Aim(); }
+static void hook_late(void* self, MethodInfo* mi) { orig_late(self, mi); if (self == g_localPC) Aim(); } // after the game's own camera work
 static void hook_es(void* self, MethodInfo* mi) { Tick(); orig_es(self, mi); } // EventSystem.Update: runs in lobby too, keeps touch alive
 
 // ---------- render side ----------
 static void Draw(int w, int h, float sx, float sy) {
     auto dl = ImGui::GetBackgroundDrawList();
+    if (C.aim && C.aimFovShow) dl->AddCircle(ImVec2(w * .5f, h * .5f), C.aimFov * sx, IM_COL32(255, 255, 255, 140), 64, 1.5f);
     std::vector<Ent> es; { std::lock_guard<std::mutex> l(g_mx); es = g_ents; }
     for (auto& e : es) {
         if (e.dist > C.maxd) continue;
@@ -325,14 +360,9 @@ static void Menu() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("AIM")) {
-            ImGui::Checkbox("aim (lock on enemy)", &C.aim); ImGui::SameLine(); ImGui::Checkbox("only while firing", &C.aonf);
-            ImGui::SliderFloat("smooth", &C.asp, 1, 30, "%.1f  (1 = fast, 30 = slow)");
-            ImGui::Checkbox("silent aim", &C.saim); ImGui::Checkbox("draw fov", &C.adraw);
-            ImGui::SliderFloat("fov", &C.afov, 1, 90, "%.0f deg");
-            ImGui::TextUnformatted("hit place:");
-            ImGui::RadioButton("head", &C.abone, 0); ImGui::SameLine(); ImGui::RadioButton("chest", &C.abone, 1);
-            ImGui::RadioButton("pelvis", &C.abone, 2); ImGui::SameLine(); ImGui::RadioButton("legs", &C.abone, 3);
-            ImGui::RadioButton("closest to crosshair", &C.abone, 4);
+            ImGui::Checkbox("enable", &C.aim); ImGui::Checkbox("only while touching", &C.aimTouch); ImGui::Checkbox("show fov", &C.aimFovShow);
+            ImGui::SliderFloat("fov (px)", &C.aimFov, 30, 800); ImGui::SliderFloat("smooth", &C.aimSmooth, 1, 20);
+            ImGui::Combo("bone", &C.aimBone, "head\0chest\0pelvis\0");
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("MEMORY")) {
@@ -386,10 +416,6 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
       io.AddMousePosEvent(g_touch.x * sx, h - g_touch.y * sy); io.AddMouseButtonEvent(0, g_touch.down); }
     ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
     if (C.esp) Draw(w, h, sx, sy);
-    if ((C.saim || C.aim) && C.adraw) {   // fov circle: angular radius -> pixels through the camera fov
-        float r = tanf(C.afov * 0.0174533f) / tanf(g_vfov * 0.5f * 0.0174533f) * (h * 0.5f); if (r > h) r = (float)h;
-        ImGui::GetBackgroundDrawList()->AddCircle(ImVec2(w * .5f, h * .5f), r, IM_COL32(255, 255, 255, 170), 64, 2.f);
-    }
     Bubble((float)w, (float)h);
     if (g_menu) Menu();
     ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -397,118 +423,6 @@ static EGLBoolean hook_swap(EGLDisplay d, EGLSurface s) {
 }
 
 // ---------- bootstrap ----------
-// ---------- AIM math / target picking ----------
-struct V3 { float x, y, z; }; struct Q4 { float x, y, z, w; };
-static V3 Sub(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-static float Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
-static V3 Norm(V3 a) { float l = sqrtf(Dot(a, a)); return l > 1e-6f ? V3{a.x / l, a.y / l, a.z / l} : V3{0, 0, 1}; }
-static V3 QFwd(Q4 q) { return {2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)}; }   // q * (0,0,1)
-static Q4 LookRot(V3 f) { // unity LookRotation(f, up)
-    V3 r = Cross(V3{0, 1, 0}, f); if (Dot(r, r) < 1e-6f) r = V3{1, 0, 0}; r = Norm(r); V3 u = Cross(f, r);
-    float m00 = r.x, m01 = u.x, m02 = f.x, m10 = r.y, m11 = u.y, m12 = f.y, m20 = r.z, m21 = u.z, m22 = f.z, tr = m00 + m11 + m22; Q4 q;
-    if (tr > 0) { float s = sqrtf(tr + 1) * 2; q = {(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, .25f * s}; }
-    else if (m00 > m11 && m00 > m22) { float s = sqrtf(1 + m00 - m11 - m22) * 2; q = {.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s}; }
-    else if (m11 > m22) { float s = sqrtf(1 + m11 - m00 - m22) * 2; q = {(m01 + m10) / s, .25f * s, (m12 + m21) / s, (m02 - m20) / s}; }
-    else { float s = sqrtf(1 + m22 - m00 - m11) * 2; q = {(m02 + m20) / s, (m12 + m21) / s, .25f * s, (m10 - m01) / s}; }
-    return q;
-}
-static void* SkelOfPc(void* pc) {
-    if (oAnim < 0 || oSkel < 0) return nullptr;
-    void* anim = Fld<void*>(pc, oAnim); if (!anim) return nullptr;
-    void* sk = Fld<void*>(anim, oSkel);
-    if (!sk && oSkelCt >= 0) sk = Fld<void*>(anim, oSkelCt);
-    if (!sk && oSkelTr >= 0) sk = Fld<void*>(anim, oSkelTr);
-    return sk;
-}
-static bool BoneAt(void* pc, int k, V3* o) { // k = index into oBone: 0 head 1 chest 2 pelvis 5/6 thighs
-    float p[3]; void* sk = SkelOfPc(pc);
-    if (sk && oBone[k] >= 0) { void* rb = Fld<void*>(sk, oBone[k]); if (rb && Pos(rb, p)) { *o = {p[0], p[1], p[2]}; return true; } }
-    if (!Pos(pc, p)) return false;                                   // fallback: feet + fixed height
-    static const float hgt[7] = {1.7f, 1.3f, 0.95f, 1.3f, 1.3f, 0.5f, 0.5f};
-    *o = {p[0], p[1] + hgt[k], p[2]}; return true;
-}
-static bool Cand(void* pc, V3 cam, V3 fwd, float& lim, V3* out) {    // best selected bone of pc inside lim deg; lim shrinks to the found angle
-    V3 c[3]; int n = 0, a = C.abone;
-    if (a == 0 || a == 4) { if (BoneAt(pc, 0, &c[n])) n++; }
-    if (a == 1 || a == 4) { if (BoneAt(pc, 1, &c[n])) n++; }
-    if (a == 2 || a == 4) { if (BoneAt(pc, 2, &c[n])) n++; }
-    if (a == 3) { V3 l, r; if (BoneAt(pc, 5, &l)) { c[n] = l; if (BoneAt(pc, 6, &r)) c[n] = {(l.x + r.x) / 2, (l.y + r.y) / 2, (l.z + r.z) / 2}; n++; } }
-    bool ok = false;
-    for (int j = 0; j < n; j++) {
-        V3 d = Sub(c[j], cam); if (sqrtf(Dot(d, d)) > C.maxd) continue;
-        float ang = acosf(fminf(fmaxf(Dot(Norm(d), fwd), -1.f), 1.f)) * 57.29578f;
-        if (ang < lim) { lim = ang; *out = c[j]; ok = true; }
-    }
-    return ok;
-}
-static bool PickTarget(V3 cam, V3 fwd, V3* out, void** who = nullptr) {
-    if (!g_arr || !g_local) return false;
-    fwd = Norm(fwd); float best = C.afov; bool ok = false;
-    for (uintptr_t i = 0; i < g_arr->len; i++) {
-        void* pc = g_arr->items[i]; if (!pc || pc == g_local || Fld<bool>(pc, oDead)) continue;
-        if (C.team && g_myTeam && TeamOf(Fld<Il2CppObject*>(pc, oPlayer)) == g_myTeam) continue;   // never aim at teammates
-        if (Cand(pc, cam, fwd, best, out)) { ok = true; if (who) *who = pc; }
-    }
-    return ok;
-}
-
-// ---------- AIM: lock on enemy, rotate the local camera towards it, exp-smoothed + deadzone ----------
-static MethodInfo *mGetRot, *mSetRot;
-static std::chrono::steady_clock::time_point g_lastFire;               // stamped by the fire hooks, gates "only while firing"
-static bool g_aimOn; static Q4 g_aimRot;                              // own rotation state while locked: survives the game rewriting the camera each frame
-static void* g_lock;                                                   // locked target: no switching between players = no jitter
-static bool AimTarget(V3 cam, V3 fwd, V3* out) {
-    if (!g_arr || !g_local) return false;
-    fwd = Norm(fwd);
-    if (g_lock) {                                                      // keep the lock while alive, in the array and inside 1.5x fov
-        bool live = false; for (uintptr_t i = 0; i < g_arr->len; i++) if (g_arr->items[i] == g_lock) { live = true; break; }
-        float l = C.afov * 1.5f;
-        if (live && !Fld<bool>(g_lock, oDead) && Cand(g_lock, cam, fwd, l, out)) return true;
-        g_lock = nullptr;
-    }
-    void* who = nullptr; if (!PickTarget(cam, fwd, out, &who)) return false;
-    g_lock = who; return true;
-}
-static void Aim(void* self) {                                          // main thread, after the game wrote the camera (LateUpdate of the local player)
-    auto now = std::chrono::steady_clock::now();
-    static auto prev = now; float dt = std::chrono::duration<float>(now - prev).count(); prev = now; if (dt > 0.1f) dt = 0.1f; if (dt < 1e-4f) dt = 1e-4f;
-    static bool was; bool engaged = was; was = false; g_aimOn = false;   // engaged = previous frame was ours
-    if (!C.aim || !mGetRot || !mSetRot || !g_arr) { g_lock = nullptr; return; }
-    if (C.aonf && now - g_lastFire > std::chrono::milliseconds(250)) { g_lock = nullptr; return; }
-    auto cam = oCam >= 0 ? Fld<Il2CppObject*>(self, oCam) : nullptr; if (!cam) cam = Inv(mCamMain, nullptr); if (!cam) return;
-    auto tr = Inv(mGetTr, cam); if (!tr) return;
-    auto rq = Inv(mGetRot, tr); if (!rq) return; Q4 cur = *(Q4*)((char*)rq + 0x10);
-    float cp[3]; if (!Pos(cam, cp)) return; V3 pos = {cp[0], cp[1], cp[2]}, t;
-    Q4 from = engaged ? g_aimRot : cur;                                // start from our own state, not from what the game rewrote
-    if (!AimTarget(pos, QFwd(from), &t)) return;
-    Q4 want = LookRot(Norm(Sub(t, pos)));
-    float dot = from.x * want.x + from.y * want.y + from.z * want.z + from.w * want.w, sg = dot < 0 ? -1.f : 1.f;   // shortest arc
-    float ang = 2.f * acosf(fminf(fabsf(dot), 1.f));                   // rad between from and want
-    Q4 o = from;
-    if (ang > 0.003f) {                                                // deadzone ~0.17 deg: inside it we hold still, no micro-jitter
-        float k = 1.f - expf(-(120.f / C.asp) * dt);                   // frame-rate independent smoothing
-        o = {from.x + (sg * want.x - from.x) * k, from.y + (sg * want.y - from.y) * k, from.z + (sg * want.z - from.z) * k, from.w + (sg * want.w - from.w) * k};
-        float l = sqrtf(o.x * o.x + o.y * o.y + o.z * o.z + o.w * o.w); if (l < 1e-6f) return; o = {o.x / l, o.y / l, o.z / l, o.w / l};
-    }
-    g_aimRot = o; g_aimOn = true; was = true;
-    void* a[1] = {&o}; Inv(mSetRot, tr, a);
-}
-
-// ---------- AIM: silent aim = redirect the shot direction, the camera never moves ----------
-static void (*o_fr)(void*, V3, V3, float, bool, MethodInfo*);            // ArmsController.FireRay(camPos, forward, distance, isKnife)
-static void h_fr(void* s, V3 cam, V3 fwd, float dist, bool knife, MethodInfo* mi) {
-    g_lastFire = std::chrono::steady_clock::now();
-    V3 t; if (C.saim && !knife && PickTarget(cam, fwd, &t)) fwd = Norm(Sub(t, cam));
-    o_fr(s, cam, fwd, dist, knife, mi);
-}
-static void (*o_fp)(void*, void*, V3, Q4, float, int, MethodInfo*);     // ArmsController.FirePellets(params, origin, aim, distance, pellets)
-static void h_fp(void* s, void* prm, V3 org, Q4 aim, float dist, int n, MethodInfo* mi) {
-    g_lastFire = std::chrono::steady_clock::now();
-    if (C.saim) { V3 t; if (PickTarget(org, QFwd(aim), &t)) aim = LookRot(Norm(Sub(t, org))); }
-    o_fp(s, prm, org, aim, dist, n, mi);
-}
-
 // ---------- MEMORY: anti recoil / anti scatter (hooks on ArmsController / RecoilControl, output zeroed in RecoilData) ----------
 static int oXd = -1, oYd = -1, oAng = -1, oRel = -1;
 static void ZeroRD(void* r) {
@@ -542,10 +456,10 @@ static void* Boot(void*) {
     kTr = Cls("UnityEngine", "Transform"); kObj = Cls("UnityEngine", "Object"); kInput = Cls("UnityEngine", "Input");
     kPhView = Cls("Photon.Pun", "PhotonView"); kPlayer = Cls("Photon.Realtime", "Player");
     mFind = Meth(kObj, "FindObjectsOfType", 2); mGetTr = Meth(kComp, "get_transform", 0); mGetPos = Meth(kTr, "get_position", 0); mGetParent = Meth(kTr, "get_parent", 0);
-    mCamMain = Meth(kCam, "get_main", 0); mCamFov = Meth(kCam, "get_fieldOfView", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
+    mGetEul = Meth(kTr, "get_eulerAngles", 0); mSetEul = Meth(kTr, "set_eulerAngles", 1);
+    mCamMain = Meth(kCam, "get_main", 0); mW2S = Meth(kCam, "WorldToScreenPoint", 1);
     { auto kScr = Cls("UnityEngine", "Screen"); mScrW = Meth(kScr, "get_width", 0); mScrH = Meth(kScr, "get_height", 0); }
     mTouchCnt = Meth(kInput, "get_touchCount", 0); mGetTouch = Meth(kInput, "GetTouch", 1);
-    mGetRot = Meth(kTr, "get_rotation", 0); mSetRot = Meth(kTr, "set_rotation", 1);
     mIsMine = Meth(kPhView, "get_IsMine", 0); mHealth = Meth(kPC, "get_Health", 0);
     mNick = Meth(kPlayer, "get_NickName", 0); mProps = Meth(kPlayer, "get_CustomProperties", 0);
     oView = Off(kPC, "_view"); oPlayer = Off(kPC, "_player"); oDead = Off(kPC, "_isDeath"); oCam = Off(kPC, "_mainCamera");
@@ -564,9 +478,9 @@ static void* Boot(void*) {
     if (mEs) { A64HookFunction(mEs->methodPointer, (void*)hook_es, (void**)&orig_es); LOG("EventSystem.Update hooked"); }
     mUpdate = Meth(kPC, "Update", 0);
     if (mUpdate) { A64HookFunction(mUpdate->methodPointer, (void*)hook_update, (void**)&orig_update); LOG("PlayerController.Update hooked"); }
-    { auto lu = Meth(kPC, "LateUpdate", 0);                            // camera aim runs here; no LateUpdate = falls back to Update
-      if (lu) { A64HookFunction(lu->methodPointer, (void*)hook_lu, (void**)&orig_lu); g_lateHooked = true; }
-      LOG("PlayerController.LateUpdate %s", lu ? "hooked" : "not found, aim runs in Update"); }
+    mLate = Meth(kPC, "LateUpdate", 0);
+    if (mLate) { A64HookFunction(mLate->methodPointer, (void*)hook_late, (void**)&orig_late); LOG("PlayerController.LateUpdate hooked"); }
+    LOG("aim: euler get=%p set=%p", (void*)mGetEul, (void*)mSetEul);
     { auto kRD = Cls("", "RecoilData"); oXd = Off(kRD, "XDeviation"); oYd = Off(kRD, "YDeviation"); oAng = Off(kRD, "AngleDispertion"); oRel = Off(kRD, "RelativeDispersion");
       auto kArms = Cls("", "ArmsController"); auto kRC = Cls("", "RecoilControl");
       auto a = Meth(kArms, "ApplyCameraRecoil", 1); auto b = Meth(kArms, "GetRelativeDispertion", 4);
@@ -576,10 +490,6 @@ static void* Boot(void*) {
       if (c) A64HookFunction(c->methodPointer, (void*)h_gns, (void**)&o_gns);
       if (d) A64HookFunction(d->methodPointer, (void*)h_gcd, (void**)&o_gcd);
       LOG("memory hooks: acr=%p grd=%p gns=%p gcd=%p fields=%d/%d/%d/%d", (void*)a, (void*)b, (void*)c, (void*)d, oXd, oYd, oAng, oRel); }
-    { auto kArms = Cls("", "ArmsController"); auto fr = Meth(kArms, "FireRay", 4); auto fp = Meth(kArms, "FirePellets", 5);
-      if (fr) A64HookFunction(fr->methodPointer, (void*)h_fr, (void**)&o_fr);
-      if (fp) A64HookFunction(fp->methodPointer, (void*)h_fp, (void**)&o_fp);
-      LOG("aim hooks: fireRay=%p firePellets=%p", (void*)fr, (void*)fp); }
     return nullptr;
 }
 static void Start() { static bool once; if (once) return; once = true; pthread_t t; pthread_create(&t, nullptr, Boot, nullptr); }
