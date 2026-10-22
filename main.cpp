@@ -486,7 +486,8 @@ static Q4 QMul(Q4 a, Q4 b) {
 }
 static V3 QFwd(Q4 q) { return {2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)}; }
 static void AimTick(void* self) {   // runs on the game thread right after the local PlayerController.Update
-    if (!C.aim || !g_local || self != g_local || !mGetRot || !mSetRot) return;
+    static bool pLock = false; static float pitchLock = 0.f;                // pitch frozen while aim holds a target
+    if (!C.aim || !g_local || self != g_local || !mGetRot || !mSetRot) { pLock = false; return; }
     Il2CppObject* cam = oCam >= 0 ? Fld<Il2CppObject*>(g_local, oCam) : nullptr;
     if (!cam) cam = Inv(mCamMain, nullptr);
     if (!cam) return;
@@ -494,10 +495,12 @@ static void AimTick(void* self) {   // runs on the game thread right after the l
     Il2CppObject *cr = Inv(mGetRot, ct), *pr = Inv(mGetRot, pt); float cp[3]; if (!cr || !pr || !Pos(cam, cp)) return;
     Q4 camQ = Unbox<Q4>(cr), bodyQ = Unbox<Q4>(pr);                         // snapshot before any write
     V3 cv = {cp[0], cp[1], cp[2]}, t, fwd = Norm(QFwd(camQ));
-    if (!PickTarget(cv, fwd, &t)) return;                                  // same fov / hit place as silent aim
+    if (!PickTarget(cv, fwd, &t)) { pLock = false; return; }                // same fov / hit place as silent aim
     V3 d = Norm(Sub(t, cv));
     const float PI = 3.14159265f;
-    float dy = atan2f(d.x, d.z) - atan2f(fwd.x, fwd.z);                     // yaw only
+    float cy = atan2f(fwd.x, fwd.z), cpi = asinf(fminf(fmaxf(fwd.y, -1.f), 1.f));
+    if (!pLock) { pLock = true; pitchLock = cpi; }                          // pitch at the moment of lock = where He put it
+    float dy = atan2f(d.x, d.z) - cy;                                       // yaw only
     while (dy > PI) dy -= 2 * PI; while (dy < -PI) dy += 2 * PI;
     float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
     float f = C.asmooth <= 1.f ? 1.f : 1.f - expf(-dt * 40.f / C.asmooth);  // frame-rate independent
@@ -506,7 +509,8 @@ static void AimTick(void* self) {   // runs on the game thread right after the l
     float h = dy * f * .5f;
     Q4 qy = {0, sinf(h), 0, cosf(h)};                                        // pure world-Y rotation: pitch/roll untouched by construction
     Q4 nb = QMul(qy, bodyQ); void* a1[1] = {&nb}; Inv(mSetRot, pt, a1);
-    Q4 nc = QMul(qy, camQ);  void* a2[1] = {&nc}; Inv(mSetRot, ct, a2);     // same yaw on the camera: identical result if it is a child of the body, still correct if not
+    float ny = cy + dy * f, c = cosf(pitchLock);                            // camera: new yaw + frozen pitch, hand swipes up/down are discarded
+    Q4 nc = LookRot(V3{c * sinf(ny), sinf(pitchLock), c * cosf(ny)}); void* a2[1] = {&nc}; Inv(mSetRot, ct, a2);
 }
 
 static void* (*il2cpp_class_get_fields)(Il2CppClass*, void**);
