@@ -88,7 +88,7 @@ static std::string Str(Il2CppString* s) { // utf16 -> utf8
 
 // ---------- config ----------
 struct Cfg {
-    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true, aim = false, avert = false;
+    bool esp = true, box = true, hp = true, name = true, dist = true, lines = false, team = true, skel = true, noRecoil = false, noSpread = false, saim = false, adraw = true, aim = false;
     float asmooth = 8.f;
     float ecol[4] = {1, .2f, .2f, 1}, tcol[4] = {.2f, .6f, 1, 1};
     float maxd = 200, thick = 2, afov = 10;
@@ -103,9 +103,9 @@ static std::vector<std::string> CfgPaths() {
 }
 static void Save() {
     char buf[1000];
-    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,\"aim\":%d,\"avert\":%d,\"asmooth\":%g,"
+    snprintf(buf, sizeof buf, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"name\":%d,\"dist\":%d,\"lines\":%d,\"team\":%d,\"skel\":%d,\"norec\":%d,\"nospr\":%d,\"saim\":%d,\"adraw\":%d,\"abone\":%d,\"afov\":%g,\"maxd\":%g,\"thick\":%g,\"aim\":%d,\"asmooth\":%g,"
              "\"e0\":%g,\"e1\":%g,\"e2\":%g,\"e3\":%g}",
-             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.aim, C.avert, C.asmooth, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
+             C.esp, C.box, C.hp, C.name, C.dist, C.lines, C.team, C.skel, C.noRecoil, C.noSpread, C.saim, C.adraw, C.abone, C.afov, C.maxd, C.thick, C.aim, C.asmooth, C.ecol[0], C.ecol[1], C.ecol[2], C.ecol[3]);
     for (auto& p : CfgPaths()) {
         mkdir(p.substr(0, p.rfind('/')).c_str(), 0771);
         FILE* f = fopen(p.c_str(), "w"); if (!f) continue;
@@ -120,7 +120,7 @@ static void Load() {
         auto g = [&](const char* k, float d) { auto q = s.find(std::string("\"") + k + "\":"); return q == std::string::npos ? d : (float)atof(s.c_str() + q + strlen(k) + 3); };
         C.esp = g("esp", 1) != 0; C.box = g("box", 1) != 0; C.hp = g("hp", 1) != 0; C.name = g("name", 1) != 0; C.dist = g("dist", 1) != 0;
         C.lines = g("lines", 0) != 0; C.team = g("team", 1) != 0; C.skel = g("skel", 1) != 0; C.noRecoil = g("norec", 0) != 0; C.noSpread = g("nospr", 0) != 0; C.saim = g("saim", 0) != 0; C.adraw = g("adraw", 1) != 0; C.abone = (int)g("abone", 0); C.afov = g("afov", 10); C.maxd = g("maxd", 200); C.thick = g("thick", 2);
-        C.aim = g("aim", 0) != 0; C.avert = g("avert", 0) != 0; C.asmooth = g("asmooth", 8.f);
+        C.aim = g("aim", 0) != 0; C.asmooth = g("asmooth", 8.f);
         const char* e[] = {"e0", "e1", "e2", "e3"}; for (int i = 0; i < 4; i++) C.ecol[i] = g(e[i], C.ecol[i]);
         g_cfgMsg = "loaded: " + p; LOG("%s", g_cfgMsg.c_str()); return;
     }
@@ -324,7 +324,7 @@ static void Menu() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("AIM")) {
-            ImGui::Checkbox("aim", &C.aim); ImGui::Checkbox("aim vertical (up/down)", &C.avert); ImGui::SliderFloat("smooth", &C.asmooth, 1, 30, "%.1f"); ImGui::Checkbox("silent aim", &C.saim); ImGui::Checkbox("draw fov", &C.adraw);
+            ImGui::Checkbox("aim", &C.aim); ImGui::SliderFloat("smooth", &C.asmooth, 1, 30, "%.1f"); ImGui::Checkbox("silent aim", &C.saim); ImGui::Checkbox("draw fov", &C.adraw);
             ImGui::SliderFloat("fov", &C.afov, 1, 90, "%.0f deg");
             ImGui::TextUnformatted("hit place:");
             ImGui::RadioButton("head", &C.abone, 0); ImGui::SameLine(); ImGui::RadioButton("chest", &C.abone, 1);
@@ -492,24 +492,21 @@ static void AimTick(void* self) {   // runs on the game thread right after the l
     if (!cam) return;
     Il2CppObject *ct = Inv(mGetTr, cam), *pt = Inv(mGetTr, g_local); if (!ct || !pt) return;
     Il2CppObject *cr = Inv(mGetRot, ct), *pr = Inv(mGetRot, pt); float cp[3]; if (!cr || !pr || !Pos(cam, cp)) return;
-    V3 cv = {cp[0], cp[1], cp[2]}, t, fwd = Norm(QFwd(Unbox<Q4>(cr)));
+    Q4 camQ = Unbox<Q4>(cr), bodyQ = Unbox<Q4>(pr);                         // snapshot before any write
+    V3 cv = {cp[0], cp[1], cp[2]}, t, fwd = Norm(QFwd(camQ));
     if (!PickTarget(cv, fwd, &t)) return;                                  // same fov / hit place as silent aim
     V3 d = Norm(Sub(t, cv));
     const float PI = 3.14159265f;
-    float cy = atan2f(fwd.x, fwd.z), cpi = asinf(fminf(fmaxf(fwd.y, -1.f), 1.f));
-    float ty = atan2f(d.x, d.z), tp = asinf(fminf(fmaxf(d.y, -1.f), 1.f));
-    float dy = ty - cy; while (dy > PI) dy -= 2 * PI; while (dy < -PI) dy += 2 * PI;
-    float dp = C.avert ? tp - cpi : 0.f;                                    // vertical off: pitch stays untouched
+    float dy = atan2f(d.x, d.z) - atan2f(fwd.x, fwd.z);                     // yaw only
+    while (dy > PI) dy -= 2 * PI; while (dy < -PI) dy += 2 * PI;
     float dt = mDt ? Unbox<float>(Inv(mDt, nullptr), 0.016f) : 0.016f;
     float f = C.asmooth <= 1.f ? 1.f : 1.f - expf(-dt * 40.f / C.asmooth);  // frame-rate independent
-    if (fabsf(dy) < 0.0087f && fabsf(dp) < 0.0087f) f = 1.f;                 // inside 0.5 deg: land exactly on the point
-    { static int n = 0; if (n++ < 12) LOG("aim tick: yaw %.2f->%.2f pitch %.2f->%.2f f=%.2f", cy * 57.3f, ty * 57.3f, cpi * 57.3f, tp * 57.3f, f); }
-    float sy = dy * f, h = sy * .5f;
-    Q4 qy = {0, sinf(h), 0, cosf(h)}, npr = QMul(qy, Unbox<Q4>(pr));         // yaw on the body: game's look code keeps it
-    void* a1[1] = {&npr}; Inv(mSetRot, pt, a1);
-    float ny = cy + sy, np = cpi + dp * f, c = cosf(np);
-    Q4 nq = LookRot(V3{c * sinf(ny), sinf(np), c * cosf(ny)});               // camera: exact result incl. pitch
-    void* a2[1] = {&nq}; Inv(mSetRot, ct, a2);
+    if (fabsf(dy) < 0.0087f) f = 1.f;                                        // inside 0.5 deg: land exactly
+    { static int n = 0; if (n++ < 12) LOG("aim tick: dyaw %.2f f=%.2f", dy * 57.3f, f); }
+    float h = dy * f * .5f;
+    Q4 qy = {0, sinf(h), 0, cosf(h)};                                        // pure world-Y rotation: pitch/roll untouched by construction
+    Q4 nb = QMul(qy, bodyQ); void* a1[1] = {&nb}; Inv(mSetRot, pt, a1);
+    Q4 nc = QMul(qy, camQ);  void* a2[1] = {&nc}; Inv(mSetRot, ct, a2);     // same yaw on the camera: identical result if it is a child of the body, still correct if not
 }
 
 static void* (*il2cpp_class_get_fields)(Il2CppClass*, void**);
